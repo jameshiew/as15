@@ -327,7 +327,7 @@ class MLXAutoEncoderOobleck(nn.Module):
     # -- construction helpers -----------------------------------------------
 
     @classmethod
-    def from_pytorch_config(cls, pt_vae) -> "MLXAutoEncoderOobleck":
+    def from_pytorch_config(cls, pt_vae) -> MLXAutoEncoderOobleck:
         """Construct from a PyTorch ``AutoencoderOobleck`` instance's config."""
         cfg = pt_vae.config
         return cls(

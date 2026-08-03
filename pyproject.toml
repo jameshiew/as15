@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
     { name = "James Hiew", email = "james@hiew.net" }
 ]
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 dependencies = [
     "huggingface-hub>=1.0,<2",
     "mlx>=0.32.0",
@@ -42,7 +42,7 @@ dev = [
 ]
 
 [tool.ruff]
-target-version = "py312"
+target-version = "py314"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
@@ -65,4 +65,4 @@ ignore = [
 
 [tool.ty.environment]
 python = ".venv"
-python-version = "3.12"
+python-version = "3.14"

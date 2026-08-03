@@ -651,7 +651,7 @@ class MLXDiTDecoder(nn.Module):
         return hidden_states, cache
 
     @classmethod
-    def from_config(cls, config) -> "MLXDiTDecoder":
+    def from_config(cls, config) -> MLXDiTDecoder:
         """Construct from an AceStepConfig (transformers PretrainedConfig)."""
         return cls(
             hidden_size=config.hidden_size,
