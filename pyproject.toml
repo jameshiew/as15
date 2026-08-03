@@ -8,16 +8,19 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    # Capped below 1.0 by the transformers 4.5x pin below.
-    "huggingface-hub>=0.34,<1.0",
+    "huggingface-hub>=1.0,<2",
     "mlx>=0.32.0",
     "numpy>=2.5.1",
     "safetensors>=0.8.0",
     "soundfile>=0.14.0",
     "torch>=2.9.1",
     # The checkpoints ship their own modeling code (trust_remote_code), written
-    # against the transformers 4.5x API. 5.x removes things it relies on.
-    "transformers>=4.51,<4.58",
+    # against the 4.5x API. It runs unmodified on 5.x -- conditioning output is
+    # bit-identical -- because the two config validators it calls
+    # (`rope_config_validation`, `layer_type_validation`) survive as shims kept
+    # expressly for remote-code models. `layer_type_validation` is slated for
+    # removal in 5.20, hence the cap; past that, those two need shimming here.
+    "transformers>=5.14,<5.20",
     "tqdm>=4.70.0",
     "typer-slim>=0.24.0",
     "einops>=0.8.2",
