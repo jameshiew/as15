@@ -1,0 +1,37 @@
+[project]
+name = "as15"
+version = "0.1.0"
+description = "Run ACE-Step 1.5 XL music generation on Apple Silicon via MLX"
+readme = "README.md"
+authors = [
+    { name = "James Hiew", email = "james@hiew.net" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    # Capped below 1.0 by the transformers 4.5x pin below.
+    "huggingface-hub>=0.34,<1.0",
+    "mlx>=0.32.0",
+    "numpy>=2.5.1",
+    "safetensors>=0.8.0",
+    "soundfile>=0.14.0",
+    "torch>=2.9.1",
+    # The checkpoints ship their own modeling code (trust_remote_code), written
+    # against the transformers 4.5x API. 5.x removes things it relies on.
+    "transformers>=4.51,<4.58",
+    "tqdm>=4.70.0",
+    "typer-slim>=0.24.0",
+    "einops>=0.8.2",
+    "vector-quantize-pytorch>=1.31.1",
+]
+
+[project.scripts]
+as15 = "as15.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
