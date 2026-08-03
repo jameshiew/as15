@@ -5,7 +5,7 @@
 #
 # Enhanced sampling modes (see issue #957):
 # - ``euler``: First-order Euler ODE/SDE step (default, original behaviour).
-# - ``heun``: Second-order Heun predictor-corrector — evaluates the model
+# - ``heun``: Second-order Heun predictor-corrector -- evaluates the model
 #   twice per step and averages the predictions for higher accuracy, which
 #   matters especially with 8-step turbo inference.
 #
@@ -20,12 +20,24 @@
 import logging
 import math
 import time
-from typing import Dict, List, Optional, Tuple, Union
+from typing import TypedDict
 
 import numpy as np
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
+
+
+class DiffusionResult(TypedDict):
+    """Return shape of :func:`mlx_generate_diffusion`.
+
+    ``time_costs`` mixes float durations with the ``sampler_mode`` label, hence
+    the widened value type.
+    """
+
+    target_latents: np.ndarray
+    time_costs: dict[str, float | str]
+
 
 VALID_SAMPLER_MODES = {"euler", "heun"}
 
@@ -33,26 +45,58 @@ VALID_SAMPLER_MODES = {"euler", "heun"}
 VALID_SHIFTS = [1.0, 2.0, 3.0]
 
 VALID_TIMESTEPS = [
-    1.0, 0.9545454545454546, 0.9333333333333333, 0.9, 0.875,
-    0.8571428571428571, 0.8333333333333334, 0.7692307692307693, 0.75,
-    0.6666666666666666, 0.6428571428571429, 0.625, 0.5454545454545454,
-    0.5, 0.4, 0.375, 0.3, 0.25, 0.2222222222222222, 0.125,
+    1.0,
+    0.9545454545454546,
+    0.9333333333333333,
+    0.9,
+    0.875,
+    0.8571428571428571,
+    0.8333333333333334,
+    0.7692307692307693,
+    0.75,
+    0.6666666666666666,
+    0.6428571428571429,
+    0.625,
+    0.5454545454545454,
+    0.5,
+    0.4,
+    0.375,
+    0.3,
+    0.25,
+    0.2222222222222222,
+    0.125,
 ]
 
 SHIFT_TIMESTEPS = {
     1.0: [1.0, 0.875, 0.75, 0.625, 0.5, 0.375, 0.25, 0.125],
-    2.0: [1.0, 0.9333333333333333, 0.8571428571428571, 0.7692307692307693,
-          0.6666666666666666, 0.5454545454545454, 0.4, 0.2222222222222222],
-    3.0: [1.0, 0.9545454545454546, 0.9, 0.8333333333333334, 0.75,
-          0.6428571428571429, 0.5, 0.3],
+    2.0: [
+        1.0,
+        0.9333333333333333,
+        0.8571428571428571,
+        0.7692307692307693,
+        0.6666666666666666,
+        0.5454545454545454,
+        0.4,
+        0.2222222222222222,
+    ],
+    3.0: [
+        1.0,
+        0.9545454545454546,
+        0.9,
+        0.8333333333333334,
+        0.75,
+        0.6428571428571429,
+        0.5,
+        0.3,
+    ],
 }
 
 
 def get_timestep_schedule(
     shift: float = 3.0,
-    timesteps: Optional[list] = None,
-    infer_steps: Optional[int] = None,
-) -> List[float]:
+    timesteps: list | None = None,
+    infer_steps: int | None = None,
+) -> list[float]:
     """Compute the timestep schedule for diffusion sampling.
 
     When ``infer_steps`` is provided and ``timesteps`` is None, a continuous
@@ -76,12 +120,16 @@ def get_timestep_schedule(
         while ts_list and ts_list[-1] == 0:
             ts_list.pop()
         if len(ts_list) < 1:
-            logger.warning("timesteps empty after removing zeros; using default shift=%s", shift)
+            logger.warning(
+                "timesteps empty after removing zeros; using default shift=%s", shift
+            )
         else:
             if len(ts_list) > 20:
                 logger.warning("timesteps length=%d > 20; truncating", len(ts_list))
                 ts_list = ts_list[:20]
-            mapped = [min(VALID_TIMESTEPS, key=lambda x, t=t: abs(x - t)) for t in ts_list]
+            mapped = [
+                min(VALID_TIMESTEPS, key=lambda x, t=t: abs(x - t)) for t in ts_list
+            ]
             t_schedule_list = mapped
 
     if t_schedule_list is None and infer_steps is not None and infer_steps > 0:
@@ -94,7 +142,9 @@ def get_timestep_schedule(
         original_shift = shift
         shift = min(VALID_SHIFTS, key=lambda x: abs(x - shift))
         if original_shift != shift:
-            logger.warning("shift=%.2f rounded to nearest valid shift=%.1f", original_shift, shift)
+            logger.warning(
+                "shift=%.2f rounded to nearest valid shift=%.1f", original_shift, shift
+            )
         t_schedule_list = SHIFT_TIMESTEPS[shift]
 
     return t_schedule_list
@@ -104,15 +154,15 @@ def _mlx_apg_forward(
     pred_cond,
     pred_uncond,
     guidance_scale: float,
-    momentum_state: Optional[Dict] = None,
+    momentum_state: dict | None = None,
     norm_threshold: float = 2.5,
 ):
-    """APG (Adaptive Projected Guidance) in pure MLX — mirrors the PyTorch ``apg_forward``.
+    """APG (Adaptive Projected Guidance) in pure MLX -- mirrors the PyTorch ``apg_forward``.
 
     Projection is performed along axis 1 (the time/sequence dimension) to match
     the PyTorch implementation which calls ``apg_forward(..., dims=[1])``.
     """
-    import mlx.core as mx
+    import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 
     proj_axis = 1
 
@@ -123,10 +173,14 @@ def _mlx_apg_forward(
 
     if norm_threshold > 0:
         diff_norm = mx.sqrt((diff * diff).sum(axis=proj_axis, keepdims=True))
-        scale_factor = mx.minimum(mx.ones_like(diff_norm), norm_threshold / (diff_norm + 1e-8))
+        scale_factor = mx.minimum(
+            mx.ones_like(diff_norm), norm_threshold / (diff_norm + 1e-8)
+        )
         diff = diff * scale_factor
 
-    v1 = pred_cond / (mx.sqrt((pred_cond * pred_cond).sum(axis=proj_axis, keepdims=True)) + 1e-8)
+    v1 = pred_cond / (
+        mx.sqrt((pred_cond * pred_cond).sum(axis=proj_axis, keepdims=True)) + 1e-8
+    )
     parallel = (diff * v1).sum(axis=proj_axis, keepdims=True) * v1
     orthogonal = diff - parallel
 
@@ -135,7 +189,8 @@ def _mlx_apg_forward(
 
 def _mlx_repaint_step_injection(xt, clean_src, mask, t_next, noise):
     """Replace non-repaint regions of *xt* with noised source latents (MLX)."""
-    import mlx.core as mx
+    import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
+
     zt = t_next * noise + (1.0 - t_next) * clean_src
     m = mx.expand_dims(mask, axis=-1)
     return mx.where(m, xt, zt)
@@ -143,7 +198,8 @@ def _mlx_repaint_step_injection(xt, clean_src, mask, t_next, noise):
 
 def _mlx_repaint_boundary_blend(x_gen, clean_src, mask_np, cf_frames):
     """Blend generated latents with source at repaint boundaries (MLX)."""
-    import mlx.core as mx
+    import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
+
     soft = mask_np.astype(np.float32).copy()
     if cf_frames <= 0:
         m = mx.expand_dims(mx.array(soft), axis=-1)
@@ -171,20 +227,20 @@ def mlx_generate_diffusion(
     mlx_decoder,
     encoder_hidden_states_np: np.ndarray,
     context_latents_np: np.ndarray,
-    src_latents_shape: Tuple[int, ...],
-    seed: Optional[Union[int, List[int]]] = None,
+    src_latents_shape: tuple[int, ...],
+    seed: int | list[int] | None = None,
     infer_method: str = "ode",
     shift: float = 3.0,
-    timesteps: Optional[list] = None,
-    infer_steps: Optional[int] = None,
+    timesteps: list | None = None,
+    infer_steps: int | None = None,
     guidance_scale: float = 1.0,
-    null_condition_emb_np: Optional[np.ndarray] = None,
+    null_condition_emb_np: np.ndarray | None = None,
     cfg_interval_start: float = 0.0,
     cfg_interval_end: float = 1.0,
     audio_cover_strength: float = 1.0,
-    encoder_hidden_states_non_cover_np: Optional[np.ndarray] = None,
-    context_latents_non_cover_np: Optional[np.ndarray] = None,
-    retake_seed: Optional[Union[int, List[int]]] = None,
+    encoder_hidden_states_non_cover_np: np.ndarray | None = None,
+    context_latents_non_cover_np: np.ndarray | None = None,
+    retake_seed: int | list[int] | None = None,
     retake_variance: float = 0.0,
     compile_model: bool = False,
     disable_tqdm: bool = False,
@@ -196,11 +252,11 @@ def mlx_generate_diffusion(
     dcw_scaler: float = 0.05,
     dcw_high_scaler: float = 0.02,
     compute_dtype: str = "bfloat16",
-    repaint_mask_np: Optional[np.ndarray] = None,
-    clean_src_latents_np: Optional[np.ndarray] = None,
+    repaint_mask_np: np.ndarray | None = None,
+    clean_src_latents_np: np.ndarray | None = None,
     repaint_crossfade_frames: int = 10,
     repaint_injection_ratio: float = 0.5,
-) -> Dict[str, object]:
+) -> DiffusionResult:
     """Run the complete MLX diffusion loop with optional CFG guidance.
 
     This is the core generation function.  It accepts numpy arrays (converted
@@ -226,23 +282,26 @@ def mlx_generate_diffusion(
         context_latents_non_cover_np: optional [B, T, C] for non-cover.
         compile_model: If True, compile the decoder step with ``mx.compile``.
         disable_tqdm: If True, suppress the diffusion progress bar.
-        sampler_mode: Sampler algorithm — ``"euler"`` (first-order, default) or
+        sampler_mode: Sampler algorithm -- ``"euler"`` (first-order, default) or
             ``"heun"`` (second-order predictor-corrector for cleaner output).
         velocity_norm_threshold: Clamp velocity prediction L2 norm relative to
             input norm at each step.  0 disables (default).  Values around
-            1.5–3.0 reduce outlier artefacts.
+            1.5-3.0 reduce outlier artefacts.
         velocity_ema_factor: Blend current velocity prediction with the previous
             step's prediction via EMA (``vt = (1-f)*vt + f*prev``).
-            0 disables (default).  Values around 0.05–0.2 smooth the trajectory.
+            0 disables (default).  Values around 0.05-0.2 smooth the trajectory.
 
     Returns:
         Dict with ``"target_latents"`` (numpy) and ``"time_costs"`` dict.
     """
-    import mlx.core as mx
+    import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
+
     from .dit import MLXCrossAttentionCache
 
     if sampler_mode not in VALID_SAMPLER_MODES:
-        raise ValueError(f"Unsupported sampler_mode '{sampler_mode}'. Expected one of {VALID_SAMPLER_MODES}.")
+        raise ValueError(
+            f"Unsupported sampler_mode '{sampler_mode}'. Expected one of {VALID_SAMPLER_MODES}."
+        )
 
     use_heun = sampler_mode == "heun"
     use_norm_clamp = velocity_norm_threshold > 0
@@ -255,13 +314,21 @@ def mlx_generate_diffusion(
                 "Falling back to Euler for SDE steps. Use infer_method='ode' for Heun."
             )
         else:
-            logger.info("[MLX-DiT] Using Heun (second-order) sampler for higher-quality output.")
+            logger.info(
+                "[MLX-DiT] Using Heun (second-order) sampler for higher-quality output."
+            )
     if use_norm_clamp:
-        logger.info("[MLX-DiT] Velocity norm clamping enabled (threshold=%.2f).", velocity_norm_threshold)
+        logger.info(
+            "[MLX-DiT] Velocity norm clamping enabled (threshold=%.2f).",
+            velocity_norm_threshold,
+        )
     if use_ema:
-        logger.info("[MLX-DiT] Velocity EMA smoothing enabled (factor=%.3f).", velocity_ema_factor)
+        logger.info(
+            "[MLX-DiT] Velocity EMA smoothing enabled (factor=%.3f).",
+            velocity_ema_factor,
+        )
 
-    time_costs = {}
+    time_costs: dict[str, float | str] = {}
     total_start = time.time()
 
     # Run the loop in the same dtype as the decoder weights. Feeding fp32
@@ -272,8 +339,16 @@ def mlx_generate_diffusion(
     enc_hs = mx.array(encoder_hidden_states_np).astype(dt)
     ctx = mx.array(context_latents_np).astype(dt)
 
-    enc_hs_nc = mx.array(encoder_hidden_states_non_cover_np).astype(dt) if encoder_hidden_states_non_cover_np is not None else None
-    ctx_nc = mx.array(context_latents_non_cover_np).astype(dt) if context_latents_non_cover_np is not None else None
+    enc_hs_nc = (
+        mx.array(encoder_hidden_states_non_cover_np).astype(dt)
+        if encoder_hidden_states_non_cover_np is not None
+        else None
+    )
+    ctx_nc = (
+        mx.array(context_latents_non_cover_np).astype(dt)
+        if context_latents_non_cover_np is not None
+        else None
+    )
 
     # ---- Repaint setup ----
     do_repaint = repaint_mask_np is not None and clean_src_latents_np is not None
@@ -296,7 +371,7 @@ def mlx_generate_diffusion(
             enc_hs_nc = mx.concatenate([enc_hs_nc, null_expanded_nc], axis=0)
         if ctx_nc is not None:
             ctx_nc = mx.concatenate([ctx_nc, ctx_nc], axis=0)
-    momentum_state: Optional[Dict] = {} if do_cfg else None
+    momentum_state: dict | None = {} if do_cfg else None
 
     # ---- Noise preparation ----
     def _draw_noise(_seed):
@@ -331,18 +406,26 @@ def mlx_generate_diffusion(
     # ---- Prepare decoder step (compiled or plain with KV cache) ----
     _compiled_step = None
     if compile_model:
+
         def _raw_step(xt, t, tr, enc, ctx):
             vt, _ = mlx_decoder(
-                hidden_states=xt, timestep=t, timestep_r=tr,
-                encoder_hidden_states=enc, context_latents=ctx,
-                cache=None, use_cache=False,
+                hidden_states=xt,
+                timestep=t,
+                timestep_r=tr,
+                encoder_hidden_states=enc,
+                context_latents=ctx,
+                cache=None,
+                use_cache=False,
             )
             return vt
 
         try:
             _compiled_step = mx.compile(_raw_step)
             logger.info("[MLX-DiT] Diffusion step compiled with mx.compile().")
-        except Exception as exc:
+        # mx.compile() is a pure optimisation and the uncompiled path is always
+        # correct, so any failure must degrade rather than propagate. MLX does
+        # not document which exception types compilation can raise.
+        except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "[MLX-DiT] mx.compile() failed (%s); using uncompiled path.", exc
             )
@@ -380,45 +463,57 @@ def mlx_generate_diffusion(
         pred_cond = vt_raw[:bsz]
         pred_uncond = vt_raw[bsz:]
         if cfg_interval_start <= current_t_val <= cfg_interval_end:
-            return _mlx_apg_forward(pred_cond, pred_uncond, guidance_scale, momentum_state)
+            return _mlx_apg_forward(
+                pred_cond, pred_uncond, guidance_scale, momentum_state
+            )
         return pred_cond
 
     def _apply_stabilisation(vt_guided, xt_current, prev_velocity):
         """Apply optional norm clamping and EMA smoothing."""
-        # Velocity norm clamping — prevents outlier predictions
+        # Velocity norm clamping -- prevents outlier predictions
         if use_norm_clamp:
             vt_norm = mx.sqrt((vt_guided * vt_guided).sum(axis=(1, 2), keepdims=True))
-            xt_norm = mx.sqrt((xt_current * xt_current).sum(axis=(1, 2), keepdims=True)) + 1e-10
+            xt_norm = (
+                mx.sqrt((xt_current * xt_current).sum(axis=(1, 2), keepdims=True))
+                + 1e-10
+            )
             scale = mx.minimum(
                 mx.ones_like(vt_norm),
                 (velocity_norm_threshold * xt_norm) / (vt_norm + 1e-10),
             )
             vt_guided = vt_guided * scale
 
-        # Velocity EMA smoothing — stabilises denoising trajectory
+        # Velocity EMA smoothing -- stabilises denoising trajectory
         if use_ema and prev_velocity is not None:
-            vt_guided = (1.0 - velocity_ema_factor) * vt_guided + velocity_ema_factor * prev_velocity
+            vt_guided = (
+                1.0 - velocity_ema_factor
+            ) * vt_guided + velocity_ema_factor * prev_velocity
 
         return vt_guided
 
     diff_start = time.time()
     _switched_to_non_cover = False
 
-    # DCW — opt-in per-band wavelet-domain correction (CVPR 2026).  On MLX,
+    # DCW -- opt-in per-band wavelet-domain correction (CVPR 2026).  On MLX,
     # `haar` runs natively; other wavelets bridge through pytorch_wavelets
     # for output parity with the CUDA/CPU PyTorch path.  See
     # `acestep.models.mlx.dcw_correction_mlx`.
     from .dcw import apply_mlx_dcw
+
     dcw_active = dcw_enabled and (
         dcw_scaler != 0.0 or (dcw_mode == "double" and dcw_high_scaler != 0.0)
     )
     if dcw_active:
         logger.info(
             "[MLX-DiT] DCW enabled (mode=%s, scaler=%.3f, high_scaler=%.3f, wavelet=haar).",
-            dcw_mode, dcw_scaler, dcw_high_scaler,
+            dcw_mode,
+            dcw_scaler,
+            dcw_high_scaler,
         )
 
-    for step_idx in tqdm(range(num_steps), desc="MLX DiT diffusion", disable=disable_tqdm):
+    for step_idx in tqdm(
+        range(num_steps), desc="MLX DiT diffusion", disable=disable_tqdm
+    ):
         current_t = t_schedule_list[step_idx]
 
         # Switch to non-cover conditions when appropriate
@@ -465,7 +560,11 @@ def mlx_generate_diffusion(
                 mx.eval(xt_predicted)
 
                 # Corrector: evaluate model at the predicted point
-                x_in2 = mx.concatenate([xt_predicted, xt_predicted], axis=0) if do_cfg else xt_predicted
+                x_in2 = (
+                    mx.concatenate([xt_predicted, xt_predicted], axis=0)
+                    if do_cfg
+                    else xt_predicted
+                )
                 vt2, cache = _model_eval(x_in2, next_t, enc_hs, ctx, cache)
                 mx.eval(vt2)
                 vt2 = _apply_cfg(vt2, next_t)
@@ -488,16 +587,19 @@ def mlx_generate_diffusion(
 
             mx.eval(xt)
 
-        # DCW correction — push x_next's frequency bands away from the
+        # DCW correction -- push x_next's frequency bands away from the
         # predicted clean sample.  Scaler decays with t_curr so this is
         # identity at t=0 and strongest at t≈1.
         if dcw_active:
             t_unsq_d = mx.full((bsz, 1, 1), current_t)
             denoised = xt_before_step - vt_for_denoise * t_unsq_d
             xt = apply_mlx_dcw(
-                xt, denoised, t_curr=current_t,
+                xt,
+                denoised,
+                t_curr=current_t,
                 enabled=True,
-                mode=dcw_mode, scaler=dcw_scaler,
+                mode=dcw_mode,
+                scaler=dcw_scaler,
                 high_scaler=dcw_high_scaler,
             )
             mx.eval(xt)
@@ -508,20 +610,28 @@ def mlx_generate_diffusion(
         if do_repaint:
             injection_cutoff = round(repaint_injection_ratio * num_steps)
             if step_idx < injection_cutoff:
-                t_after = t_schedule_list[step_idx + 1] if step_idx < num_steps - 1 else 0.0
-                xt = _mlx_repaint_step_injection(xt, clean_src_mx, repaint_mask_mx, t_after, noise)
+                t_after = (
+                    t_schedule_list[step_idx + 1] if step_idx < num_steps - 1 else 0.0
+                )
+                xt = _mlx_repaint_step_injection(
+                    xt, clean_src_mx, repaint_mask_mx, t_after, noise
+                )
                 mx.eval(xt)
 
     # ---- Repaint boundary blend (post-loop) ----
     if do_repaint and repaint_crossfade_frames > 0:
-        xt = _mlx_repaint_boundary_blend(xt, clean_src_mx, repaint_mask_np, repaint_crossfade_frames)
+        xt = _mlx_repaint_boundary_blend(
+            xt, clean_src_mx, repaint_mask_np, repaint_crossfade_frames
+        )
         mx.eval(xt)
 
     diff_end = time.time()
     total_end = time.time()
 
     time_costs["diffusion_time_cost"] = diff_end - diff_start
-    time_costs["diffusion_per_step_time_cost"] = time_costs["diffusion_time_cost"] / max(num_steps, 1)
+    time_costs["diffusion_per_step_time_cost"] = time_costs[
+        "diffusion_time_cost"
+    ] / max(num_steps, 1)
     time_costs["total_time_cost"] = total_end - total_start
     time_costs["sampler_mode"] = sampler_mode
 

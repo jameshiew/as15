@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import mlx.core as mx
+import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 import numpy as np
 
 from .convert import NULL_COND_KEY, convert_dit, convert_vae
@@ -64,7 +64,9 @@ def tiled_decode(
 
         head = (start - lo) * VAE_HOP
         tail = (hi - end) * VAE_HOP
-        parts.append(audio[:, head : audio.shape[1] - tail, :] if tail else audio[:, head:, :])
+        parts.append(
+            audio[:, head : audio.shape[1] - tail, :] if tail else audio[:, head:, :]
+        )
         mx.eval(parts[-1])
         del audio
         mx.clear_cache()
@@ -97,7 +99,7 @@ class GenerationResult:
     audio: np.ndarray  # [samples, channels], float32
     sample_rate: int
     seed: int | None
-    timings: dict = field(default_factory=dict)
+    timings: dict[str, float | str] = field(default_factory=dict)
 
 
 def _resolve_snapshots(spec: ModelSpec) -> tuple[Path, Path]:
@@ -147,7 +149,7 @@ def generate(
     from .conditioning import Conditioner
     from .mlx.sampler import mlx_generate_diffusion
 
-    timings: dict[str, float] = {}
+    timings: dict[str, float | str] = {}
     steps = request.steps if request.steps is not None else spec.steps
     guidance = request.guidance if request.guidance is not None else spec.guidance
     shift = request.shift if request.shift is not None else spec.shift
@@ -246,4 +248,4 @@ def write_audio(path: Path, audio: np.ndarray, sample_rate: int) -> None:
 
 
 def latent_frames_for(duration: float) -> int:
-    return max(1, int(round(duration * LATENT_FPS)))
+    return max(1, round(duration * LATENT_FPS))

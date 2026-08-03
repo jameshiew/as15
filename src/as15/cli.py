@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 import sys
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated
 
 import typer
 
@@ -44,19 +44,19 @@ def sing(
         ),
     ],
     lyrics: Annotated[
-        Optional[str], typer.Option("--lyrics", "-l", help="Lyrics as a string.")
+        str | None, typer.Option("--lyrics", "-l", help="Lyrics as a string.")
     ] = None,
     lyrics_file: Annotated[
-        Optional[Path],
+        Path | None,
         typer.Option(
             "--lyrics-file",
             "-L",
             help="Read lyrics from a file, or '-' for stdin.",
         ),
     ] = None,
-    out: Annotated[
-        Path, typer.Option("--out", "-o", help="Output audio file.")
-    ] = Path("song.wav"),
+    out: Annotated[Path, typer.Option("--out", "-o", help="Output audio file.")] = Path(
+        "song.wav"
+    ),
     model: Annotated[
         str, typer.Option("--model", "-m", help=f"One of: {', '.join(MODELS)}.")
     ] = DEFAULT_MODEL,
@@ -64,34 +64,32 @@ def sing(
         float, typer.Option("--duration", "-d", min=10, max=600, help="Seconds.")
     ] = 120.0,
     steps: Annotated[
-        Optional[int], typer.Option("--steps", "-s", help="Diffusion steps.")
+        int | None, typer.Option("--steps", "-s", help="Diffusion steps.")
     ] = None,
     guidance: Annotated[
-        Optional[float],
+        float | None,
         typer.Option("--guidance", "-g", help="CFG scale (ignored by turbo)."),
     ] = None,
     shift: Annotated[
-        Optional[float],
+        float | None,
         typer.Option("--shift", help="Timestep shift. Default depends on model."),
     ] = None,
     seed: Annotated[
-        Optional[int], typer.Option("--seed", help="Random seed. Omit for random.")
+        int | None, typer.Option("--seed", help="Random seed. Omit for random.")
     ] = None,
     language: Annotated[
         str, typer.Option("--language", help="Vocal language code.")
     ] = "en",
-    bpm: Annotated[Optional[int], typer.Option("--bpm", help="Target tempo.")] = None,
+    bpm: Annotated[int | None, typer.Option("--bpm", help="Target tempo.")] = None,
     key: Annotated[
-        Optional[str], typer.Option("--key", help="Key/scale, e.g. 'C major'.")
+        str | None, typer.Option("--key", help="Key/scale, e.g. 'C major'.")
     ] = None,
     time_signature: Annotated[
-        Optional[int], typer.Option("--time-signature", help="2, 3, 4 or 6.")
+        int | None, typer.Option("--time-signature", help="2, 3, 4 or 6.")
     ] = None,
-    sampler: Annotated[
-        str, typer.Option("--sampler", help="euler or heun.")
-    ] = "euler",
+    sampler: Annotated[str, typer.Option("--sampler", help="euler or heun.")] = "euler",
     dcw: Annotated[
-        Optional[bool],
+        bool | None,
         typer.Option(
             "--dcw/--no-dcw",
             help=(
@@ -106,7 +104,9 @@ def sing(
     device: Annotated[
         str, typer.Option("--device", help="Torch device for conditioning.")
     ] = "auto",
-    quiet: Annotated[bool, typer.Option("--quiet", "-q", help="No progress bar.")] = False,
+    quiet: Annotated[
+        bool, typer.Option("--quiet", "-q", help="No progress bar.")
+    ] = False,
 ) -> None:
     """Generate a song from a style prompt and lyrics."""
     spec = resolve(model)
@@ -202,8 +202,14 @@ def download(
     dit_snapshot, base_snapshot = _resolve_snapshots(spec)
     dit_path = convert_dit(dit_snapshot, spec.cache_name, precision)
     vae_path = convert_vae(base_snapshot / "vae")
-    typer.secho(f"DiT  {dit_path}  ({dit_path.stat().st_size / 1e9:.2f} GB)", fg=typer.colors.GREEN)
-    typer.secho(f"VAE  {vae_path}  ({vae_path.stat().st_size / 1e9:.2f} GB)", fg=typer.colors.GREEN)
+    typer.secho(
+        f"DiT  {dit_path}  ({dit_path.stat().st_size / 1e9:.2f} GB)",
+        fg=typer.colors.GREEN,
+    )
+    typer.secho(
+        f"VAE  {vae_path}  ({vae_path.stat().st_size / 1e9:.2f} GB)",
+        fg=typer.colors.GREEN,
+    )
 
 
 if __name__ == "__main__":

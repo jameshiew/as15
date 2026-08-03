@@ -7,11 +7,10 @@
 # All operations use MLX channels-last (NLC) convention internally.
 # The public encode/decode API accepts and returns NLC arrays.
 
-import math
 import logging
-from typing import List, Optional, Tuple
+import math
 
-import mlx.core as mx
+import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 import mlx.nn as nn
 
 logger = logging.getLogger(__name__)
@@ -20,6 +19,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Snake1d Activation
 # ---------------------------------------------------------------------------
+
 
 class MLXSnake1d(nn.Module):
     """Snake activation: x + (1/beta) * sin(alpha * x)^2.
@@ -59,6 +59,7 @@ class MLXSnake1d(nn.Module):
 # Residual Unit
 # ---------------------------------------------------------------------------
 
+
 class MLXOobleckResidualUnit(nn.Module):
     """Two weight-normalised Conv1d layers (k=7 dilated + k=1) wrapped with
     Snake1d activations and a residual skip connection."""
@@ -90,6 +91,7 @@ class MLXOobleckResidualUnit(nn.Module):
 # ---------------------------------------------------------------------------
 # Encoder / Decoder Blocks
 # ---------------------------------------------------------------------------
+
 
 class MLXOobleckEncoderBlock(nn.Module):
     """3 residual units (dilations 1, 3, 9) -> Snake -> strided Conv1d down."""
@@ -146,6 +148,7 @@ class MLXOobleckDecoderBlock(nn.Module):
 # Encoder / Decoder
 # ---------------------------------------------------------------------------
 
+
 class MLXOobleckEncoder(nn.Module):
     """Oobleck Encoder: Conv1d -> N encoder blocks -> Snake -> Conv1d."""
 
@@ -153,12 +156,12 @@ class MLXOobleckEncoder(nn.Module):
         self,
         encoder_hidden_size: int,
         audio_channels: int,
-        downsampling_ratios: List[int],
-        channel_multiples: List[int],
+        downsampling_ratios: list[int],
+        channel_multiples: list[int],
     ):
         super().__init__()
         strides = downsampling_ratios
-        cm = [1] + list(channel_multiples)
+        cm = [1, *channel_multiples]
 
         self.conv1 = nn.Conv1d(
             audio_channels, encoder_hidden_size, kernel_size=7, padding=3
@@ -195,12 +198,12 @@ class MLXOobleckDecoder(nn.Module):
         channels: int,
         input_channels: int,
         audio_channels: int,
-        upsampling_ratios: List[int],
-        channel_multiples: List[int],
+        upsampling_ratios: list[int],
+        channel_multiples: list[int],
     ):
         super().__init__()
         strides = upsampling_ratios
-        cm = [1] + list(channel_multiples)
+        cm = [1, *channel_multiples]
 
         self.conv1 = nn.Conv1d(
             input_channels, channels * cm[-1], kernel_size=7, padding=3
@@ -234,6 +237,7 @@ class MLXOobleckDecoder(nn.Module):
 # Full VAE
 # ---------------------------------------------------------------------------
 
+
 class MLXAutoEncoderOobleck(nn.Module):
     """Pure-MLX re-implementation of ``diffusers.AutoencoderOobleck``.
 
@@ -251,8 +255,8 @@ class MLXAutoEncoderOobleck(nn.Module):
     def __init__(
         self,
         encoder_hidden_size: int = 128,
-        downsampling_ratios: Optional[List[int]] = None,
-        channel_multiples: Optional[List[int]] = None,
+        downsampling_ratios: list[int] | None = None,
+        channel_multiples: list[int] | None = None,
         decoder_channels: int = 128,
         decoder_input_channels: int = 64,
         audio_channels: int = 2,

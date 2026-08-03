@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import mlx.core as mx
+import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 from tqdm import tqdm
 
 from .models import cache_root
@@ -133,6 +133,7 @@ def convert_dit(
 # VAE
 # ---------------------------------------------------------------------------
 
+
 def _fuse_weight_norm(g: mx.array, v: mx.array, eps: float = 1e-9) -> mx.array:
     """Fuse ``weight_norm``'s ``w = g * v / ||v||`` into a single tensor.
 
@@ -170,9 +171,13 @@ def convert_vae(vae_dir: Path, force: bool = False) -> Path:
                 raise RuntimeError(f"{key} has no matching {v_key}")
             w = _fuse_weight_norm(source[key], source[v_key])
             # conv_t1 is the only ConvTranspose1d in this model.
-            w = mx.transpose(w, (1, 2, 0)) if "conv_t1" in base else mx.swapaxes(w, 1, 2)
+            w = (
+                mx.transpose(w, (1, 2, 0))
+                if "conv_t1" in base
+                else mx.swapaxes(w, 1, 2)
+            )
             weights[base + ".weight"] = w
-        elif key.endswith(".alpha") or key.endswith(".beta"):
+        elif key.endswith((".alpha", ".beta")):
             # Snake1d params: [1, C, 1] -> [C]
             weights[key] = source[key].astype(mx.float32).squeeze()
         else:

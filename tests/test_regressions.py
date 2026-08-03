@@ -6,7 +6,7 @@ listening (or spectral flatness) revealed them.
 
 from __future__ import annotations
 
-import mlx.core as mx
+import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 import numpy as np
 import pytest
 
@@ -54,6 +54,7 @@ def test_turbo_does_not_use_cfg():
 
 # --- weight conversion layout -------------------------------------------
 
+
 def test_conv_layout_swaps_in_and_kernel_axes():
     # PyTorch Conv1d [out, in, K] -> MLX [out, K, in]
     w = mx.arange(2 * 3 * 5).reshape(2, 3, 5)
@@ -71,13 +72,28 @@ def test_conv_transpose_layout_moves_in_channels_last():
 
 
 def test_dit_key_mapping_unwraps_sequential_and_drops_rope():
-    assert convert._convert_dit_key("decoder.proj_in.1.weight") == ("proj_in.weight", "conv")
-    assert convert._convert_dit_key("decoder.proj_out.1.weight") == ("proj_out.weight", "conv_t")
-    assert convert._convert_dit_key("decoder.proj_in.1.bias") == ("proj_in.bias", "plain")
+    assert convert._convert_dit_key("decoder.proj_in.1.weight") == (
+        "proj_in.weight",
+        "conv",
+    )
+    assert convert._convert_dit_key("decoder.proj_out.1.weight") == (
+        "proj_out.weight",
+        "conv_t",
+    )
+    assert convert._convert_dit_key("decoder.proj_in.1.bias") == (
+        "proj_in.bias",
+        "plain",
+    )
     # RoPE tables are recomputed by the MLX model.
-    assert convert._convert_dit_key("decoder.layers.0.self_attn.rotary_emb.inv_freq") is None
+    assert (
+        convert._convert_dit_key("decoder.layers.0.self_attn.rotary_emb.inv_freq")
+        is None
+    )
     # Only the DiT subtree is converted; the FSQ codec never runs for text2music.
-    assert convert._convert_dit_key("encoder.lyric_encoder.layers.0.mlp.up_proj.weight") is None
+    assert (
+        convert._convert_dit_key("encoder.lyric_encoder.layers.0.mlp.up_proj.weight")
+        is None
+    )
     assert convert._convert_dit_key("tokenizer.quantizer.weight") is None
 
 
@@ -92,6 +108,7 @@ def test_weight_norm_fusion_matches_definition():
 
 
 # --- latent geometry -----------------------------------------------------
+
 
 def test_latent_frame_rate():
     from as15.models import LATENT_FPS, SAMPLE_RATE, VAE_HOP

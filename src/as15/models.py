@@ -79,9 +79,7 @@ def ensure_snapshot(repo_id: str, allow_patterns: list[str] | None = None) -> Pa
     """Return a local snapshot dir for *repo_id*, downloading if needed."""
     from huggingface_hub import snapshot_download
 
-    return Path(
-        snapshot_download(repo_id=repo_id, allow_patterns=allow_patterns)
-    )
+    return Path(snapshot_download(repo_id=repo_id, allow_patterns=allow_patterns))
 
 
 def load_dit_config(snapshot: Path) -> SimpleNamespace:

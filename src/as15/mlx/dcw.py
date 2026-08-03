@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import math
 
-import mlx.core as mx
+import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 
 VALID_DCW_MODES = ("low", "high", "double", "pix")
 

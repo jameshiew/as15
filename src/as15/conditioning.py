@@ -139,7 +139,13 @@ class Conditioner:
         self.encoder = encoder.to(self.device).eval()
 
         text_dir = base_snapshot / "Qwen3-Embedding-0.6B"
-        self.tokenizer = AutoTokenizer.from_pretrained(text_dir)
+        # `from_pretrained` is typed as possibly returning None; checking here
+        # turns a missing/broken tokenizer into a clear error at load time
+        # rather than a `NoneType is not callable` inside `build`.
+        tokenizer = AutoTokenizer.from_pretrained(text_dir)
+        if tokenizer is None:
+            raise RuntimeError(f"No usable tokenizer in {text_dir}")
+        self.tokenizer = tokenizer
         self.text_encoder = (
             AutoModel.from_pretrained(text_dir, dtype=dtype).to(self.device).eval()
         )
@@ -207,7 +213,7 @@ class Conditioner:
             refer_audio_order_mask=refer_order_mask,
         )
 
-        frames = max(1, int(round(duration * LATENT_FPS)))
+        frames = max(1, round(duration * LATENT_FPS))
         src_latents = self.silence_slice(frames)
         chunk_masks = torch.full_like(src_latents, CHUNK_MASK_FULL)
         context_latents = torch.cat([src_latents, chunk_masks], dim=-1)
@@ -224,10 +230,15 @@ class Conditioner:
         )
 
     def release(self) -> None:
-        """Drop the torch models so their memory is free before MLX loads."""
-        self.encoder = None
-        self.text_encoder = None
-        self.silence_latent = None
+        """Drop the torch models so their memory is free before MLX loads.
+
+        Terminal and idempotent: the conditioner cannot be used afterwards.
+        The attributes are deleted rather than set to ``None`` so that a
+        use-after-release raises an ``AttributeError`` naming the missing
+        model, instead of ``NoneType is not callable`` from inside ``build``.
+        """
+        for name in ("encoder", "text_encoder", "silence_latent"):
+            self.__dict__.pop(name, None)
         if self.device.type == "mps":
             torch.mps.empty_cache()
 
@@ -264,7 +275,7 @@ def _load_encoder_state_dict(snapshot: Path, dtype: torch.dtype) -> dict:
 
 def _load_null_condition_emb(snapshot: Path) -> np.ndarray:
     """Read the CFG null-condition embedding from the converted MLX cache."""
-    import mlx.core as mx
+    import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 
     from .convert import NULL_COND_KEY
 
