@@ -178,7 +178,6 @@ class MLXAttention(nn.Module):
         self.num_heads = num_attention_heads
         self.num_kv_heads = num_key_value_heads
         self.head_dim = head_dim
-        self.n_rep = num_attention_heads // num_key_value_heads
         self.scale = head_dim**-0.5
         self.layer_idx = layer_idx
         self.is_cross_attention = is_cross_attention
@@ -199,16 +198,6 @@ class MLXAttention(nn.Module):
 
         self.q_norm = nn.RMSNorm(head_dim, eps=rms_norm_eps)
         self.k_norm = nn.RMSNorm(head_dim, eps=rms_norm_eps)
-
-    @staticmethod
-    def _repeat_kv(x: mx.array, n_rep: int) -> mx.array:
-        """Repeat KV heads for GQA: [B, n_kv, L, D] -> [B, n_kv*n_rep, L, D]."""
-        if n_rep == 1:
-            return x
-        B, n_kv, L, D = x.shape
-        x = mx.expand_dims(x, axis=2)  # [B, n_kv, 1, L, D]
-        x = mx.broadcast_to(x, (B, n_kv, n_rep, L, D))
-        return x.reshape(B, n_kv * n_rep, L, D)
 
     def __call__(
         self,
@@ -258,11 +247,11 @@ class MLXAttention(nn.Module):
                 cos, sin = position_cos_sin
                 q, k = _apply_rotary_pos_emb(q, k, cos, sin)
 
-        # GQA: repeat KV heads to match Q heads
-        k = self._repeat_kv(k, self.n_rep)
-        v = self._repeat_kv(v, self.n_rep)
-
-        # Scaled dot-product attention
+        # Scaled dot-product attention. K/V keep their own head count: MLX's
+        # fast kernel takes grouped-query attention directly and asks that the
+        # heads not be tiled out to match Q first. Doing that tiling by hand
+        # materialised a 4x copy of every K and V on the XL config (32 query
+        # heads over 8 key/value heads), on both attentions of all 24 layers.
         attn_out = mx.fast.scaled_dot_product_attention(
             q, k, v, scale=self.scale, mask=attention_mask
         )

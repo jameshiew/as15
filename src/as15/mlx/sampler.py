@@ -539,12 +539,21 @@ def mlx_generate_diffusion(
                 "[MLX-DiT] mx.compile() failed (%s); using uncompiled path.", exc
             )
 
-    # Note: Heun solver requires two model evaluations per step with
-    # different inputs, so we disable KV caching when using it.
-    if use_heun:
-        cache = None
-    else:
-        cache = MLXCrossAttentionCache() if _compiled_step is None else None
+    # The cache holds cross-attention K/V, which are projected from
+    # ``encoder_hidden_states`` and nothing else -- no noisy latent, no
+    # timestep. One entry per layer therefore stays valid across every step,
+    # across both of Heun's evaluations, and across CFG's doubled batch, whose
+    # conditioning is doubled the same way. The only thing that invalidates it
+    # is the conditioning itself changing, which happens at the
+    # cover-to-non-cover switch in the loop and is handled there. Caching was
+    # previously off for CFG and for Heun -- that is, on the whole default SFT
+    # path -- which reprojected the conditioning through every layer's k_proj
+    # and v_proj on all 100 evaluations of a 50-step run.
+    #
+    # The compiled step still gets no cache: mx.compile traces a pure function
+    # of its arguments, so a Python-side dict of arrays would be frozen into
+    # the trace rather than filled on the first call.
+    cache = MLXCrossAttentionCache() if _compiled_step is None else None
 
     xt = noise
     prev_vt = None  # for EMA smoothing
@@ -567,7 +576,7 @@ def mlx_generate_diffusion(
             encoder_hidden_states=enc,
             context_latents=ctx_in,
             cache=step_cache,
-            use_cache=(not do_cfg and not use_heun),
+            use_cache=True,
         )
         return vt_out, step_cache
 
