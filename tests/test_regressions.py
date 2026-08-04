@@ -6,12 +6,14 @@ listening (or spectral flatness) revealed them.
 
 from __future__ import annotations
 
+import json
+
 import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 import numpy as np
 import pytest
 
 from as15 import conditioning, convert
-from as15.models import MODELS
+from as15.models import BASE_REPO, BASE_REVISION, MODELS, Snapshot
 
 
 def test_chunk_mask_is_one_not_two():
@@ -105,6 +107,98 @@ def test_weight_norm_fusion_matches_definition():
     norms = np.linalg.norm(v_np.reshape(2, -1), axis=1).reshape(2, 1, 1)
     expected = np.array(g).reshape(2, 1, 1) * v_np / norms
     assert np.allclose(fused, expected, atol=1e-5)
+
+
+# --- converted-weight cache identity -------------------------------------
+
+
+def test_every_repo_is_pinned_to_a_commit():
+    """Unpinned repos make the cache -- and the tuned defaults -- unreproducible."""
+    revisions = [BASE_REVISION, *(spec.revision for spec in MODELS.values())]
+    for revision in revisions:
+        assert len(revision) == 40
+        assert set(revision) <= set("0123456789abcdef")
+
+
+def test_cache_paths_separate_every_identity_component(monkeypatch, tmp_path):
+    """Repo, commit, converter version and precision must not alias."""
+    monkeypatch.setenv("AS15_CACHE", str(tmp_path))
+    paths = {
+        convert.dit_cache_path("acestep-v15-xl-sft", "aaaa", "bf16"),
+        convert.dit_cache_path("acestep-v15-xl-sft", "aaaa", "fp32"),
+        convert.dit_cache_path("acestep-v15-xl-sft", "bbbb", "bf16"),
+        convert.dit_cache_path("acestep-v15-xl-turbo", "aaaa", "bf16"),
+        convert.vae_cache_path("aaaa"),
+        convert.vae_cache_path("bbbb"),
+    }
+    assert len(paths) == 6
+    # The converter version is in the filename, so a bump orphans the old file
+    # rather than reusing weights in a layout the MLX models no longer expect.
+    assert f"-v{convert.DIT_CONVERTER_VERSION}-" in (
+        convert.dit_cache_path("m", "aaaa", "bf16").name
+    )
+    assert f"-v{convert.VAE_CONVERTER_VERSION}-" in convert.vae_cache_path("aaaa").name
+
+
+def test_a_revision_is_flattened_into_one_path_component(monkeypatch, tmp_path):
+    monkeypatch.setenv("AS15_CACHE", str(tmp_path))
+    path = convert.dit_cache_path("m", "refs/pr/7", "bf16")
+    assert path.parent.name == "refs-pr-7"
+    assert path.parent.parent.name == "m"
+
+
+def _dit_manifest(snapshot: Snapshot, precision: str = "bf16") -> dict:
+    return {
+        "asset": "dit",
+        "converter_version": convert.DIT_CONVERTER_VERSION,
+        "precision": precision,
+        "repo_id": snapshot.repo_id,
+        "revision": snapshot.revision,
+    }
+
+
+def test_cache_is_reused_only_when_the_manifest_matches(monkeypatch, tmp_path):
+    """A weights file with no matching manifest must not be trusted.
+
+    Loading a DiT converted from different bytes does not fail -- it generates
+    audibly worse audio -- so the check has to happen before reuse.
+    """
+    monkeypatch.setenv("AS15_CACHE", str(tmp_path))
+    snapshot = Snapshot("ACE-Step/acestep-v15-xl-sft", "a" * 40, tmp_path / "snap")
+    out = convert.dit_cache_path(snapshot.cache_name, snapshot.revision, "bf16")
+    out.parent.mkdir(parents=True)
+    out.write_bytes(b"not really safetensors")
+
+    manifest = _dit_manifest(snapshot)
+    assert not convert._cache_hit(out, manifest)  # no manifest written yet
+
+    convert._manifest_path(out).write_text(json.dumps(manifest))
+    assert convert._cache_hit(out, manifest)
+
+    # A manifest describing anything else is a miss, not a silent reuse.
+    stale = Snapshot(snapshot.repo_id, "b" * 40, snapshot.path)
+    assert not convert._cache_hit(out, _dit_manifest(stale))
+    assert not convert._cache_hit(out, _dit_manifest(snapshot, precision="fp32"))
+    convert._manifest_path(out).write_text("{ truncated")
+    assert not convert._cache_hit(out, manifest)
+
+
+def test_shared_vae_cache_is_keyed_on_the_base_repo(monkeypatch, tmp_path):
+    """The VAE is shared across checkpoints, so only the base repo pins it."""
+    monkeypatch.setenv("AS15_CACHE", str(tmp_path))
+    out = convert.vae_cache_path(BASE_REVISION)
+    out.parent.mkdir(parents=True)
+    out.write_bytes(b"")
+    manifest = {
+        "asset": "vae",
+        "converter_version": convert.VAE_CONVERTER_VERSION,
+        "precision": "fp32",
+        "repo_id": BASE_REPO,
+        "revision": BASE_REVISION,
+    }
+    convert._manifest_path(out).write_text(json.dumps(manifest))
+    assert convert._cache_hit(out, manifest)
+    assert not convert._cache_hit(convert.vae_cache_path("c" * 40), manifest)
 
 
 # --- latent geometry -----------------------------------------------------

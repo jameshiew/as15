@@ -151,7 +151,7 @@ def sing(
     eff_guidance = guidance if guidance is not None else spec.guidance
     if not spec.supports_cfg:
         eff_guidance = 1.0
-    typer.secho(f"model     {spec.key}  ({spec.repo_id})", err=True)
+    typer.secho(f"model     {spec.key}  ({spec.repo_id}@{spec.revision[:8]})", err=True)
     typer.secho(f"duration  {duration:g}s   steps {eff_steps}   seed {seed}", err=True)
     typer.secho(
         f"sampling  shift {eff_shift:g}   guidance {eff_guidance:g}   "
@@ -184,7 +184,10 @@ def list_models() -> None:
     """List available checkpoints."""
     for key, spec in MODELS.items():
         default = "  (default)" if key == DEFAULT_MODEL else ""
-        typer.echo(f"{key}{default}\n  {spec.description}\n  {spec.repo_id}\n")
+        typer.echo(
+            f"{key}{default}\n  {spec.description}\n"
+            f"  {spec.repo_id}@{spec.revision[:8]}\n"
+        )
 
 
 @app.command()
@@ -200,8 +203,8 @@ def download(
 
     spec = resolve(model)
     dit_snapshot, base_snapshot = _resolve_snapshots(spec)
-    dit_path = convert_dit(dit_snapshot, spec.cache_name, precision)
-    vae_path = convert_vae(base_snapshot / "vae")
+    dit_path = convert_dit(dit_snapshot, precision)
+    vae_path = convert_vae(base_snapshot)
     typer.secho(
         f"DiT  {dit_path}  ({dit_path.stat().st_size / 1e9:.2f} GB)",
         fg=typer.colors.GREEN,

@@ -15,17 +15,27 @@ bfloat16 dtype (the VAE ships bf16).
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 from tqdm import tqdm
 
-from .models import cache_root
+from .models import Snapshot, cache_root
 
 DTYPES = {"bf16": mx.bfloat16, "fp32": mx.float32}
 
 # Emitted alongside the DiT weights; needed to build the CFG null branch.
 NULL_COND_KEY = "null_condition_emb"
+
+# Bump when a converter's output stops matching what the previous version
+# wrote -- renamed keys, a changed axis permutation, a different dtype policy.
+# The version is part of the cache path, so a bump orphans the old file rather
+# than silently loading weights the current MLX models cannot interpret. The
+# two converters version independently: the DiT cache is ~8.3 GB and there is
+# no reason to rebuild it when only the 337 MB VAE conversion changes.
+DIT_CONVERTER_VERSION = 1
+VAE_CONVERTER_VERSION = 1
 
 
 def _shard_files(snapshot: Path) -> list[Path]:
@@ -78,13 +88,60 @@ def _apply_layout(value: mx.array, layout: str) -> mx.array:
     return value
 
 
-def dit_cache_path(cache_name: str, precision: str) -> Path:
-    return cache_root() / cache_name / f"dit-{precision}.safetensors"
+# ---------------------------------------------------------------------------
+# Cache identity
+#
+# A converted file is only reusable for the exact (repo, commit, converter,
+# precision) it was produced from. Upstream republishes weights under the same
+# repo ID, so keying on the repo name alone would silently serve a cache built
+# from different bytes -- and a mismatched-but-loadable DiT generates degraded
+# audio rather than failing. The tuple goes in the path so distinct inputs
+# cannot collide, and in a sidecar manifest so a reused file is checked rather
+# than trusted.
+# ---------------------------------------------------------------------------
+
+
+def _path_safe(component: str) -> str:
+    """Flatten a revision into a single path component."""
+    return component.replace("/", "-").replace("\\", "-") or "unknown"
+
+
+def _manifest_path(weights: Path) -> Path:
+    return weights.with_suffix(".json")
+
+
+def _cache_hit(weights: Path, manifest: Mapping[str, object]) -> bool:
+    """True if *weights* exists and was written from exactly this input."""
+    if not weights.exists():
+        return False
+    try:
+        recorded = json.loads(_manifest_path(weights).read_text())
+    except OSError, ValueError:
+        return False  # never written, half-written, or hand-edited
+    return recorded == manifest
+
+
+def _write_cache(
+    weights: dict[str, mx.array], out: Path, manifest: Mapping[str, object]
+) -> None:
+    """Write *weights* then its manifest, so a crash leaves no valid cache."""
+    tmp = out.with_suffix(".tmp.safetensors")
+    mx.save_safetensors(str(tmp), weights)
+    tmp.replace(out)
+    _manifest_path(out).write_text(json.dumps(manifest, indent=2, sort_keys=True))
+
+
+def dit_cache_path(cache_name: str, revision: str, precision: str) -> Path:
+    return (
+        cache_root()
+        / cache_name
+        / _path_safe(revision)
+        / f"dit-v{DIT_CONVERTER_VERSION}-{precision}.safetensors"
+    )
 
 
 def convert_dit(
-    snapshot: Path,
-    cache_name: str,
+    snapshot: Snapshot,
     precision: str = "bf16",
     force: bool = False,
 ) -> Path:
@@ -92,15 +149,22 @@ def convert_dit(
 
     Returns the path to the cached safetensors file.
     """
-    out = dit_cache_path(cache_name, precision)
-    if out.exists() and not force:
+    out = dit_cache_path(snapshot.cache_name, snapshot.revision, precision)
+    manifest: dict[str, object] = {
+        "asset": "dit",
+        "converter_version": DIT_CONVERTER_VERSION,
+        "precision": precision,
+        "repo_id": snapshot.repo_id,
+        "revision": snapshot.revision,
+    }
+    if _cache_hit(out, manifest) and not force:
         return out
 
     dtype = DTYPES[precision]
     out.parent.mkdir(parents=True, exist_ok=True)
 
     weights: dict[str, mx.array] = {}
-    shards = _shard_files(snapshot)
+    shards = _shard_files(snapshot.path)
     for shard in tqdm(shards, desc=f"Converting DiT -> {precision}", unit="shard"):
         source = mx.load(str(shard))
         for key, value in source.items():
@@ -120,12 +184,10 @@ def convert_dit(
 
     if NULL_COND_KEY not in weights:
         raise RuntimeError(
-            f"{NULL_COND_KEY!r} missing from {snapshot}; CFG cannot be built."
+            f"{NULL_COND_KEY!r} missing from {snapshot.path}; CFG cannot be built."
         )
 
-    tmp = out.with_suffix(".tmp.safetensors")
-    mx.save_safetensors(str(tmp), weights)
-    tmp.replace(out)
+    _write_cache(weights, out, manifest)
     return out
 
 
@@ -145,20 +207,33 @@ def _fuse_weight_norm(g: mx.array, v: mx.array, eps: float = 1e-9) -> mx.array:
     return g.astype(mx.float32) * v / (norm + eps)
 
 
-def vae_cache_path() -> Path:
-    return cache_root() / "vae" / "vae-fp32.safetensors"
+def vae_cache_path(revision: str) -> Path:
+    return (
+        cache_root()
+        / "vae"
+        / _path_safe(revision)
+        / f"vae-v{VAE_CONVERTER_VERSION}-fp32.safetensors"
+    )
 
 
-def convert_vae(vae_dir: Path, force: bool = False) -> Path:
+def convert_vae(base: Snapshot, force: bool = False) -> Path:
     """Fuse weight-norm and re-layout the Oobleck VAE for MLX.
 
     The VAE stays fp32: it is only 337 MB and runs once per generation.
     """
-    out = vae_cache_path()
-    if out.exists() and not force:
+    out = vae_cache_path(base.revision)
+    manifest: dict[str, object] = {
+        "asset": "vae",
+        "converter_version": VAE_CONVERTER_VERSION,
+        "precision": "fp32",
+        "repo_id": base.repo_id,
+        "revision": base.revision,
+    }
+    if _cache_hit(out, manifest) and not force:
         return out
     out.parent.mkdir(parents=True, exist_ok=True)
 
+    vae_dir = base.path / "vae"
     source = mx.load(str(vae_dir / "diffusion_pytorch_model.safetensors"))
     weights: dict[str, mx.array] = {}
     for key in tqdm(sorted(source), desc="Converting VAE", unit="tensor"):
@@ -184,7 +259,5 @@ def convert_vae(vae_dir: Path, force: bool = False) -> Path:
             weights[key] = source[key].astype(mx.float32)
     mx.eval(list(weights.values()))
 
-    tmp = out.with_suffix(".tmp.safetensors")
-    mx.save_safetensors(str(tmp), weights)
-    tmp.replace(out)
+    _write_cache(weights, out, manifest)
     return out

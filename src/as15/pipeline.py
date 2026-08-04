@@ -14,11 +14,13 @@ import numpy as np
 from .convert import NULL_COND_KEY, convert_dit, convert_vae
 from .models import (
     BASE_REPO,
+    BASE_REVISION,
     LATENT_CHANNELS,
     LATENT_FPS,
     SAMPLE_RATE,
     VAE_HOP,
     ModelSpec,
+    Snapshot,
     ensure_snapshot,
     load_dit_config,
 )
@@ -102,17 +104,19 @@ class GenerationResult:
     timings: dict[str, float | str] = field(default_factory=dict)
 
 
-def _resolve_snapshots(spec: ModelSpec) -> tuple[Path, Path]:
-    dit_snapshot = ensure_snapshot(spec.repo_id)
-    base_snapshot = ensure_snapshot(BASE_REPO, allow_patterns=BASE_PATTERNS)
+def _resolve_snapshots(spec: ModelSpec) -> tuple[Snapshot, Snapshot]:
+    dit_snapshot = ensure_snapshot(spec.repo_id, spec.revision)
+    base_snapshot = ensure_snapshot(
+        BASE_REPO, BASE_REVISION, allow_patterns=BASE_PATTERNS
+    )
     return dit_snapshot, base_snapshot
 
 
-def _load_vae(base_snapshot: Path):
+def _load_vae(base_snapshot: Snapshot):
     from .mlx.vae import MLXAutoEncoderOobleck
 
-    path = convert_vae(base_snapshot / "vae")
-    cfg = json.loads((base_snapshot / "vae" / "config.json").read_text())
+    path = convert_vae(base_snapshot)
+    cfg = json.loads((base_snapshot.path / "vae" / "config.json").read_text())
     vae = MLXAutoEncoderOobleck(
         encoder_hidden_size=cfg["encoder_hidden_size"],
         downsampling_ratios=cfg["downsampling_ratios"],
@@ -126,11 +130,11 @@ def _load_vae(base_snapshot: Path):
     return vae
 
 
-def _load_dit(dit_snapshot: Path, spec: ModelSpec, precision: str):
+def _load_dit(dit_snapshot: Snapshot, precision: str):
     from .mlx.dit import MLXDiTDecoder
 
-    path = convert_dit(dit_snapshot, spec.cache_name, precision)
-    config = load_dit_config(dit_snapshot)
+    path = convert_dit(dit_snapshot, precision)
+    config = load_dit_config(dit_snapshot.path)
     weights = mx.load(str(path))
     weights.pop(NULL_COND_KEY, None)
     dit = MLXDiTDecoder.from_config(config)
@@ -165,7 +169,7 @@ def generate(
     timings["resolve"] = time.time() - t0
 
     t0 = time.time()
-    conditioner = Conditioner(dit_snapshot, base_snapshot, device=device)
+    conditioner = Conditioner(dit_snapshot.path, base_snapshot.path, device=device)
     timings["load_conditioner"] = time.time() - t0
 
     t0 = time.time()
@@ -186,7 +190,7 @@ def generate(
 
     # --- Diffusion (MLX) ---------------------------------------------------
     t0 = time.time()
-    dit = _load_dit(dit_snapshot, spec, request.precision)
+    dit = _load_dit(dit_snapshot, request.precision)
     timings["load_dit"] = time.time() - t0
 
     compute_dtype = "bfloat16" if request.precision == "bf16" else "float32"

@@ -10,6 +10,11 @@ from types import SimpleNamespace
 
 # Shared assets: VAE + Qwen3 text encoder (+ the 5Hz LM, which we do not use).
 BASE_REPO = "ACE-Step/Ace-Step1.5"
+# Every repo is pinned to a commit. Upstream force-pushes weights under the same
+# repo ID, and a swapped checkpoint is silent -- it still generates audio, just
+# worse -- so an unpinned fetch would quietly invalidate both the cached MLX
+# weights and the sampling defaults that were tuned against these commits.
+BASE_REVISION = "19671f406d603126926c1b7e2adc169acbcade22"
 
 # Latent geometry. The Oobleck VAE downsamples by prod([2,4,4,6,10]) = 1920,
 # so at 48 kHz one latent frame is 40 ms -> 25 frames per second.
@@ -25,6 +30,7 @@ class ModelSpec:
 
     key: str
     repo_id: str
+    revision: str
     steps: int
     guidance: float
     supports_cfg: bool
@@ -36,15 +42,12 @@ class ModelSpec:
     shift: float
     description: str
 
-    @property
-    def cache_name(self) -> str:
-        return self.repo_id.split("/")[-1]
-
 
 MODELS: dict[str, ModelSpec] = {
     "xl-sft": ModelSpec(
         key="xl-sft",
         repo_id="ACE-Step/acestep-v15-xl-sft",
+        revision="d06de46b4622f781cf07f4a013a67d591ca52819",
         steps=50,
         guidance=7.0,
         supports_cfg=True,
@@ -55,6 +58,7 @@ MODELS: dict[str, ModelSpec] = {
     "xl-turbo": ModelSpec(
         key="xl-turbo",
         repo_id="ACE-Step/acestep-v15-xl-turbo",
+        revision="d4a0b288b83ebb7e25a8c0b32c573c22e134e8ee",
         steps=8,
         guidance=1.0,
         supports_cfg=False,
@@ -75,11 +79,35 @@ def cache_root() -> Path:
     return Path.home() / ".cache" / "as15"
 
 
-def ensure_snapshot(repo_id: str, allow_patterns: list[str] | None = None) -> Path:
-    """Return a local snapshot dir for *repo_id*, downloading if needed."""
+@dataclass(frozen=True)
+class Snapshot:
+    """A downloaded checkpoint, identified by the commit it resolved to."""
+
+    repo_id: str
+    revision: str
+    path: Path
+
+    @property
+    def cache_name(self) -> str:
+        return self.repo_id.split("/")[-1]
+
+
+def ensure_snapshot(
+    repo_id: str, revision: str, allow_patterns: list[str] | None = None
+) -> Snapshot:
+    """Return a local snapshot of *repo_id* at *revision*, downloading if needed."""
     from huggingface_hub import snapshot_download
 
-    return Path(snapshot_download(repo_id=repo_id, allow_patterns=allow_patterns))
+    path = Path(
+        snapshot_download(
+            repo_id=repo_id, revision=revision, allow_patterns=allow_patterns
+        )
+    )
+    # snapshot_download always lays snapshots out as ``snapshots/<commit sha>``,
+    # so the directory name is the resolved commit even when *revision* is a
+    # branch or tag. Prefer it over *revision* -- it is what the bytes on disk
+    # actually are, which is what the converted-weight cache must be keyed on.
+    return Snapshot(repo_id=repo_id, revision=path.name or revision, path=path)
 
 
 def load_dit_config(snapshot: Path) -> SimpleNamespace:

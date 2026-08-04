@@ -46,7 +46,10 @@ uv sync
 ```
 
 Weights download from Hugging Face on first use (~19 GB per DiT checkpoint, plus
-~1.5 GB shared VAE and text encoder) into the usual `~/.cache/huggingface`.
+~1.5 GB shared VAE and text encoder) into the usual `~/.cache/huggingface`. Every
+repo is pinned to a commit (`uv run as15 models` prints which), so an upstream
+republish cannot change what you get, or invalidate the sampling defaults and
+timings below without a code change.
 
 Fetch and pre-convert ahead of time:
 
@@ -99,7 +102,12 @@ is the reference implementation rather than a re-derivation, and it is released
 before the DiT loads to keep peak memory down. Everything that runs per-step is MLX.
 
 DiT weights are published as fp32 (~20 GB); they are converted once to bf16 MLX
-safetensors (~8.3 GB) in `~/.cache/as15`. The port was verified against the
+safetensors (~8.3 GB) under
+`~/.cache/as15/<checkpoint>/<commit>/dit-v<converter>-<precision>.safetensors`
+(override the root with `AS15_CACHE`). Commit and converter version are part of
+the path, and repeated in a sidecar `.json` that is checked before a cached file
+is reused — a cache built from other bytes still loads, it just generates worse
+audio, so it must not be silently trusted. The port was verified against the
 reference PyTorch DiT: **0.999378** output correlation on identical inputs, the
 residual being bf16 rounding. bf16 and fp32 generations are spectrally
 indistinguishable, so bf16 is the default.
