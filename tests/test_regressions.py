@@ -12,7 +12,7 @@ import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 import numpy as np
 import pytest
 
-from as15 import conditioning, convert
+from as15 import conditioning, convert, models
 from as15.models import BASE_REPO, BASE_REVISION, MODELS, Snapshot
 
 
@@ -210,6 +210,43 @@ def test_latent_frame_rate():
     # The Oobleck VAE downsamples by prod([2, 4, 4, 6, 10]).
     assert VAE_HOP == 2 * 4 * 4 * 6 * 10
     assert LATENT_FPS == SAMPLE_RATE // VAE_HOP == 25
+
+
+# vae/config.json as published at BASE_REVISION. Not the Stable Audio Oobleck
+# geometry ([2, 4, 4, 8, 8] at 44.1 kHz), which is what makes the check worth
+# having.
+PINNED_VAE_CONFIG = {
+    "audio_channels": 2,
+    "channel_multiples": [1, 2, 4, 8, 16],
+    "decoder_channels": 128,
+    "decoder_input_channels": 64,
+    "downsampling_ratios": [2, 4, 4, 6, 10],
+    "encoder_hidden_size": 128,
+    "sampling_rate": 48000,
+}
+
+
+def test_pinned_vae_config_matches_the_latent_geometry():
+    models.check_vae_geometry(PINNED_VAE_CONFIG)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("downsampling_ratios", [2, 4, 4, 8, 8], "hop 2048"),
+        ("sampling_rate", 44100, "sampling rate 44100"),
+        ("decoder_input_channels", 128, "latent channels 128"),
+    ],
+)
+def test_a_checkpoint_that_moves_the_latent_geometry_is_rejected(field, value, message):
+    """Conditioning sizes the latent window before the VAE is loaded.
+
+    A checkpoint on a different hop, rate or latent width would decode to the
+    wrong duration rather than fail, so the mismatch has to be caught at load.
+    """
+    cfg = {**PINNED_VAE_CONFIG, field: value}
+    with pytest.raises(RuntimeError, match=message):
+        models.check_vae_geometry(cfg)
 
 
 def test_metas_block_format():

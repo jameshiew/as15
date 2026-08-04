@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
+from math import prod
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 # Shared assets: VAE + Qwen3 text encoder (+ the 5Hz LM, which we do not use).
 BASE_REPO = "ACE-Step/Ace-Step1.5"
@@ -22,6 +25,35 @@ SAMPLE_RATE = 48_000
 VAE_HOP = 1920
 LATENT_FPS = SAMPLE_RATE // VAE_HOP  # 25
 LATENT_CHANNELS = 64
+
+
+def check_vae_geometry(cfg: Mapping[str, Any]) -> None:
+    """Fail if a VAE checkpoint contradicts the constants above.
+
+    Those constants are the runtime's contract, not a cached copy of the
+    config: conditioning sizes the latent window from ``LATENT_FPS`` before the
+    VAE is ever loaded, and the DiT was trained against that rate. Deriving the
+    hop from whatever config is on disk would therefore turn a swapped
+    checkpoint into wrong-rate audio rather than an error -- so check it
+    instead. The check is cheap and runs on the JSON, before any weights.
+    """
+    problems = []
+    hop = prod(cfg["downsampling_ratios"])
+    if hop != VAE_HOP:
+        problems.append(
+            f"hop {hop} (ratios {list(cfg['downsampling_ratios'])}) != {VAE_HOP}"
+        )
+    if cfg["sampling_rate"] != SAMPLE_RATE:
+        problems.append(f"sampling rate {cfg['sampling_rate']} != {SAMPLE_RATE}")
+    if cfg["decoder_input_channels"] != LATENT_CHANNELS:
+        problems.append(
+            f"latent channels {cfg['decoder_input_channels']} != {LATENT_CHANNELS}"
+        )
+    if problems:
+        raise RuntimeError(
+            "VAE checkpoint contradicts the runtime latent geometry: "
+            + "; ".join(problems)
+        )
 
 
 @dataclass(frozen=True)

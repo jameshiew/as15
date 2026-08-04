@@ -21,6 +21,7 @@ from .models import (
     VAE_HOP,
     ModelSpec,
     Snapshot,
+    check_vae_geometry,
     ensure_snapshot,
     load_dit_config,
 )
@@ -117,6 +118,7 @@ def _load_vae(base_snapshot: Snapshot):
 
     path = convert_vae(base_snapshot)
     cfg = json.loads((base_snapshot.path / "vae" / "config.json").read_text())
+    check_vae_geometry(cfg)
     vae = MLXAutoEncoderOobleck(
         encoder_hidden_size=cfg["encoder_hidden_size"],
         downsampling_ratios=cfg["downsampling_ratios"],

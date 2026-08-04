@@ -241,32 +241,28 @@ class MLXOobleckDecoder(nn.Module):
 class MLXAutoEncoderOobleck(nn.Module):
     """Pure-MLX re-implementation of ``diffusers.AutoencoderOobleck``.
 
-    Default configuration matches the Stable Audio / ACE-Step VAE:
-        encoder_hidden_size  = 128
-        downsampling_ratios  = [2, 4, 4, 8, 8]   (hop_length = 2048)
-        channel_multiples    = [1, 2, 4, 8, 16]
-        decoder_channels     = 128
-        decoder_input_channels = 64               (latent dim)
-        audio_channels       = 2                  (stereo)
+    Every geometry parameter is required, deliberately. ACE-Step 1.5 is not
+    configured like the Stable Audio VAE it descends from -- it downsamples by
+    [2, 4, 4, 6, 10] (hop 1920) at 48 kHz, where Stable Audio uses
+    [2, 4, 4, 8, 8] (hop 2048) at 44.1 kHz -- so any default here would be a
+    second, contradictory source of truth for the latent rate that the rest of
+    the runtime pins in ``models.LATENT_FPS``. Callers pass the checkpoint's
+    ``config.json`` through instead, and ``models.check_vae_geometry`` checks
+    that config against those constants before construction.
 
     Data flows in NLC (batch, length, channels) format throughout.
     """
 
     def __init__(
         self,
-        encoder_hidden_size: int = 128,
-        downsampling_ratios: list[int] | None = None,
-        channel_multiples: list[int] | None = None,
-        decoder_channels: int = 128,
-        decoder_input_channels: int = 64,
-        audio_channels: int = 2,
+        encoder_hidden_size: int,
+        downsampling_ratios: list[int],
+        channel_multiples: list[int],
+        decoder_channels: int,
+        decoder_input_channels: int,
+        audio_channels: int,
     ):
         super().__init__()
-        if downsampling_ratios is None:
-            downsampling_ratios = [2, 4, 4, 8, 8]
-        if channel_multiples is None:
-            channel_multiples = [1, 2, 4, 8, 16]
-
         self.encoder_hidden_size = encoder_hidden_size
         self.decoder_input_channels = decoder_input_channels
 
