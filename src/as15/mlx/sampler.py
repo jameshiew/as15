@@ -458,7 +458,13 @@ def mlx_generate_diffusion(
 
     def _model_eval(x_input, t_val, enc, ctx_in, step_cache):
         """Single model evaluation helper."""
-        t_arr = mx.full((x_input.shape[0],), t_val)
+        # Every scalar the loop broadcasts -- timesteps here, step sizes below --
+        # is built at ``dt``. ``mx.full`` infers float32 from a Python float, and
+        # one float32 operand promotes the bf16 tensor it touches, so an implicit
+        # dtype here leaks float32 into the timestep MLP and from there, through
+        # the AdaLN modulation, into every layer. Upstream sizes the same arrays
+        # off ``context_latents.dtype``.
+        t_arr = mx.full((x_input.shape[0],), t_val, dtype=dt)
         if _compiled_step is not None:
             return _compiled_step(x_input, t_arr, t_arr, enc, ctx_in), step_cache
         vt_out, step_cache = mlx_decoder(
@@ -587,7 +593,7 @@ def mlx_generate_diffusion(
         if use_heun and infer_method == "ode":
             # ---- Heun (second-order) ODE step ----
             # Predictor: Euler step to get xt_predicted at next_t
-            delta_arr = mx.full((bsz, 1, 1), delta)
+            delta_arr = mx.full((bsz, 1, 1), delta, dtype=dt)
             xt_predicted = xt - vt * delta_arr
             mx.eval(xt_predicted)
 
@@ -607,7 +613,7 @@ def mlx_generate_diffusion(
             xt = xt - vt_avg * delta_arr
             vt = vt_avg  # store averaged velocity for EMA
         elif infer_method == "sde":
-            t_unsq = mx.full((bsz, 1, 1), current_t)
+            t_unsq = mx.full((bsz, 1, 1), current_t, dtype=dt)
             pred_clean = xt - vt * t_unsq
             # next_t == 0 on the last interval: the blend is then all clean
             # sample, so skip the draw rather than scale it away -- MLX's
@@ -619,7 +625,7 @@ def mlx_generate_diffusion(
                 xt = pred_clean
         else:
             # ---- Standard Euler ODE step ----
-            delta_arr = mx.full((bsz, 1, 1), delta)
+            delta_arr = mx.full((bsz, 1, 1), delta, dtype=dt)
             xt = xt - vt * delta_arr
 
         mx.eval(xt)
@@ -628,7 +634,7 @@ def mlx_generate_diffusion(
         # predicted clean sample.  Scaler decays with t_curr so this is
         # identity at t=0 and strongest at t≈1.
         if dcw_active:
-            t_unsq_d = mx.full((bsz, 1, 1), current_t)
+            t_unsq_d = mx.full((bsz, 1, 1), current_t, dtype=dt)
             denoised = xt_before_step - vt_for_denoise * t_unsq_d
             xt = apply_mlx_dcw(
                 xt,
@@ -669,7 +675,9 @@ def mlx_generate_diffusion(
     time_costs["total_time_cost"] = total_end - total_start
     time_costs["sampler_mode"] = sampler_mode
 
-    result_np = np.array(xt)
+    # numpy has no bfloat16, and MLX refuses the buffer protocol for it, so the
+    # loop's dtype has to be widened here rather than at the call site.
+    result_np = np.array(xt.astype(mx.float32))
     return {
         "target_latents": result_np,
         "time_costs": time_costs,

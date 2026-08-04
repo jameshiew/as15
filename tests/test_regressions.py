@@ -118,8 +118,11 @@ class _ConstantDecoder:
         cache,
         use_cache,
     ):
-        self.timesteps.append(float(np.array(timestep)[0]))
+        self.timesteps.append(float(np.array(timestep.astype(mx.float32))[0]))
         rows = mx.arange(hidden_states.shape[0]).reshape(-1, 1, 1)
+        # A real decoder answers in its own dtype; an int32 ``arange`` here
+        # would promote the result and hide the dtype leaks under test.
+        rows = rows.astype(hidden_states.dtype)
         return mx.ones_like(hidden_states) + 0.1 * rows, cache
 
 
@@ -130,7 +133,7 @@ STEPS = len(SCHEDULE)
 NOISE_SHAPE = (1, 4, 8)
 
 
-def _run_sampler(decoder, **kwargs):
+def _run_sampler(decoder, compute_dtype: str = "float32", **kwargs):
     from as15.mlx.sampler import mlx_generate_diffusion
 
     b, t, c = NOISE_SHAPE
@@ -144,7 +147,7 @@ def _run_sampler(decoder, **kwargs):
         shift=1.0,
         dcw_enabled=False,
         disable_tqdm=True,
-        compute_dtype="float32",
+        compute_dtype=compute_dtype,
         **kwargs,
     )
 
@@ -240,6 +243,117 @@ def test_sde_draws_no_noise_for_the_interval_that_ends_at_zero(monkeypatch):
     _run_sampler(_ConstantDecoder(), infer_method="sde")
 
     assert len(keyless) == STEPS - 1
+
+
+# --- compute dtype -------------------------------------------------------
+
+
+class _DtypeRecordingDecoder(_ConstantDecoder):
+    """Records the dtype of every array the sampler hands the decoder."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.dtypes: list = []
+
+    def __call__(self, **kwargs):
+        self.dtypes += [
+            kwargs["hidden_states"].dtype,
+            kwargs["timestep"].dtype,
+            kwargs["timestep_r"].dtype,
+        ]
+        return super().__call__(**kwargs)
+
+
+@pytest.mark.parametrize("sampler_mode", ["euler", "heun"])
+@pytest.mark.parametrize("infer_method", ["ode", "sde"])
+def test_the_loop_stays_in_the_compute_dtype(sampler_mode, infer_method):
+    """``mx.full`` infers float32 from a Python float.
+
+    The timesteps and step sizes the loop broadcasts were built without a
+    dtype, and one float32 operand promotes the bf16 array it touches -- so
+    the latents left the compute dtype on the first step, and the timestep
+    reached the embedding MLP in float32 and carried the promotion through
+    AdaLN into every layer. MLX then widened the bf16 weights per op, paying
+    both the bandwidth and the peak memory of a float32 4B model.
+    """
+    decoder = _DtypeRecordingDecoder()
+    _run_sampler(
+        decoder,
+        sampler_mode=sampler_mode,
+        infer_method=infer_method,
+        compute_dtype="bfloat16",
+        **_cfg_kwargs(),
+    )
+
+    assert decoder.dtypes
+    assert set(decoder.dtypes) == {mx.bfloat16}
+
+
+def test_latents_come_back_as_numpy_from_a_bf16_loop():
+    """numpy has no bfloat16 and MLX refuses the buffer protocol for it.
+
+    Only the float32 leak kept ``np.array(xt)`` working on the default path.
+    """
+    result = _run_sampler(_ConstantDecoder(), compute_dtype="bfloat16")
+    assert result["target_latents"].dtype == np.float32
+
+
+def test_rope_tables_are_handed_out_in_the_activation_dtype():
+    """float32 cos/sin would promote every query and key they multiply.
+
+    transformers' Qwen3RotaryEmbedding -- which upstream uses -- ends its
+    forward with ``cos.to(dtype=x.dtype)`` for the same reason.
+    """
+    from as15.mlx.dit import MLXRotaryEmbedding
+
+    rope = MLXRotaryEmbedding(head_dim=8, max_len=16, base=1e6)
+    cos, sin = rope(4, mx.bfloat16)
+    assert cos.dtype == sin.dtype == mx.bfloat16
+    assert cos.shape == sin.shape == (1, 1, 4, 8)
+
+    # The tables themselves stay float32: the angles need the headroom.
+    exact_cos, _ = rope(4, mx.float32)
+    assert exact_cos.dtype == mx.float32
+    assert np.allclose(np.array(cos.astype(mx.float32)), np.array(exact_cos), atol=1e-2)
+
+
+def test_a_bf16_decoder_forward_stays_bf16_end_to_end():
+    """One float32 input is enough to widen the whole stack.
+
+    Sized down from the XL config; the dtype plumbing is shape-independent.
+    """
+    from as15.mlx.dit import MLXDiTDecoder
+
+    decoder = MLXDiTDecoder(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        in_channels=12,
+        audio_acoustic_hidden_dim=4,
+        patch_size=2,
+        sliding_window=4,
+        max_position_embeddings=64,
+        encoder_hidden_size=6,
+    )
+    decoder.set_dtype(mx.bfloat16)
+
+    def _forward(timestep):
+        out, _ = decoder(
+            hidden_states=mx.zeros((1, 8, 4), dtype=mx.bfloat16),
+            timestep=timestep,
+            timestep_r=timestep,
+            encoder_hidden_states=mx.zeros((1, 3, 6), dtype=mx.bfloat16),
+            context_latents=mx.zeros((1, 8, 8), dtype=mx.bfloat16),
+        )
+        return out
+
+    assert _forward(mx.full((1,), 0.75, dtype=mx.bfloat16)).dtype == mx.bfloat16
+    # Pin the promotion the sampler used to trigger, so the fix is not silently
+    # undone by dropping the dtype at the one call site that builds it.
+    assert _forward(mx.full((1,), 0.75)).dtype == mx.float32
 
 
 # --- weight conversion layout -------------------------------------------

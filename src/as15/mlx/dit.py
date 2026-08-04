@@ -74,14 +74,29 @@ class MLXRotaryEmbedding(nn.Module):
         positions = mx.arange(max_len).astype(mx.float32)
         freqs = positions[:, None] * inv_freq[None, :]  # [max_len, head_dim//2]
         freqs = mx.concatenate([freqs, freqs], axis=-1)  # [max_len, head_dim]
+        # Tabulated in float32 -- the angles need the headroom -- but handed out
+        # in the activation dtype, exactly as transformers' Qwen3RotaryEmbedding
+        # does with its trailing ``cos.to(dtype=x.dtype)``.
         self._cos = mx.cos(freqs)  # [max_len, head_dim]
         self._sin = mx.sin(freqs)  # [max_len, head_dim]
+        self._slices: dict[tuple[int, str], tuple[mx.array, mx.array]] = {}
 
-    def __call__(self, seq_len: int) -> tuple[mx.array, mx.array]:
-        """Return (cos, sin) each shaped [1, 1, seq_len, head_dim]."""
-        cos = self._cos[:seq_len][None, None, :, :]
-        sin = self._sin[:seq_len][None, None, :, :]
-        return cos, sin
+    def __call__(
+        self, seq_len: int, dtype: mx.Dtype = mx.float32
+    ) -> tuple[mx.array, mx.array]:
+        """Return (cos, sin) each shaped [1, 1, seq_len, head_dim] in *dtype*.
+
+        Returning the float32 tables instead would promote every query and key
+        they multiply, dragging the whole attention stack out of the compute
+        dtype for the rest of the layer.
+        """
+        key = (seq_len, str(dtype))
+        if key not in self._slices:
+            cos = self._cos[:seq_len].astype(dtype)[None, None, :, :]
+            sin = self._sin[:seq_len].astype(dtype)[None, None, :, :]
+            mx.eval(cos, sin)
+            self._slices[key] = (cos, sin)
+        return self._slices[key]
 
     def materialize_static_buffers(self) -> None:
         """Materialize cached RoPE tables on the current MLX stream.
@@ -610,7 +625,7 @@ class MLXDiTDecoder(nn.Module):
         dtype = hidden_states.dtype
 
         # Position embeddings (RoPE)
-        cos, sin = self.rotary_emb(seq_len)
+        cos, sin = self.rotary_emb(seq_len, dtype)
 
         # Attention masks
         # Self-attention: full layers get None; sliding layers get windowed mask
