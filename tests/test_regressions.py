@@ -6,8 +6,10 @@ listening (or spectral flatness) revealed them.
 
 from __future__ import annotations
 
+import fcntl
 import itertools
 import json
+from pathlib import Path
 
 import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 import numpy as np
@@ -818,6 +820,69 @@ def test_cache_is_reused_only_when_the_manifest_matches(monkeypatch, tmp_path):
     assert not convert._cache_hit(out, _dit_manifest(snapshot, precision="fp32"))
     convert._manifest_path(out).write_text("{ truncated")
     assert not convert._cache_hit(out, manifest)
+
+
+def test_only_one_process_at_a_time_may_write_a_cache(monkeypatch, tmp_path):
+    """Two cold starts used to each run the same ~8.3 GB DiT conversion.
+
+    They also raced on one fixed temporary name, so either could rename the
+    other's half-written file over the real cache.
+    """
+    monkeypatch.setenv("AS15_CACHE", str(tmp_path))
+    out = convert.dit_cache_path("m", "a" * 40, "bf16")
+    lock = out.with_suffix(".lock")
+
+    with convert._cache_lock(out):
+        assert lock.exists()  # and the parent directory was created for it
+        # flock is held per open file description, so a second handle behaves
+        # exactly like a second process.
+        with lock.open("w") as rival, pytest.raises(BlockingIOError):
+            fcntl.flock(rival, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    # Released on the way out, so the next writer proceeds immediately.
+    with lock.open("w") as rival:
+        fcntl.flock(rival, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_concurrent_writers_never_share_a_temporary_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("AS15_CACHE", str(tmp_path))
+    out = convert.dit_cache_path("m", "a" * 40, "bf16")
+    out.parent.mkdir(parents=True)
+
+    seen: list[Path] = []
+
+    def record(tmp: Path) -> None:
+        seen.append(tmp)
+        tmp.write_bytes(b"")
+
+    convert._publish(out, record)
+    convert._publish(out, record)
+
+    assert seen[0] != seen[1]
+    # Same directory, so replace() is a rename and not a copy across devices.
+    assert all(tmp.parent == out.parent for tmp in seen)
+    # mx.save_safetensors dispatches on the extension and fails with a bare
+    # FileNotFoundError if the temporary does not carry it.
+    assert all(tmp.name.endswith(".safetensors") for tmp in seen)
+    assert out.read_bytes() == b""
+
+
+def test_a_failed_write_leaves_neither_a_partial_cache_nor_debris(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("AS15_CACHE", str(tmp_path))
+    out = convert.vae_cache_path("a" * 40)
+    out.parent.mkdir(parents=True)
+
+    def explode(tmp: Path) -> None:
+        tmp.write_bytes(b"half a tensor")
+        raise RuntimeError("no space left on device")
+
+    with pytest.raises(RuntimeError):
+        convert._publish(out, explode)
+
+    assert not out.exists()
+    assert list(out.parent.iterdir()) == []
 
 
 def test_shared_vae_cache_is_keyed_on_the_base_repo(monkeypatch, tmp_path):

@@ -14,9 +14,12 @@ bfloat16 dtype (the VAE ships bf16).
 
 from __future__ import annotations
 
+import fcntl
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
+from uuid import uuid4
 
 import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 from tqdm import tqdm
@@ -141,14 +144,62 @@ def _cache_hit(weights: Path, manifest: Mapping[str, object]) -> bool:
     return recorded == manifest
 
 
+@contextmanager
+def _cache_lock(target: Path) -> Iterator[None]:
+    """Hold an exclusive advisory lock over *target* for the block.
+
+    Two processes reaching a cold cache together would otherwise each run the
+    whole ~8.3 GB DiT conversion and race to publish the result. Locking
+    around the conversion rather than around the write makes the second one
+    wait and then hit the cache the first wrote.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.with_suffix(".lock").open("w") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # Said only once we know we will actually block, because the wait
+            # is as long as a conversion and looks like a hang otherwise.
+            print(f"Waiting for another process to write {target.name} ...")
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+    # The lock is released by the close above; the empty lock file stays, as
+    # unlinking it would let a waiter lock a path nobody else can see.
+
+
+def _publish(target: Path, write: Callable[[Path], object]) -> None:
+    """Install whatever *write* produces at *target*, atomically.
+
+    The temporary lives in the destination directory so ``replace`` is a
+    same-filesystem rename, and carries a random component so a writer that
+    somehow skipped :func:`_cache_lock` cannot rename another writer's
+    half-finished file into place. It keeps *target*'s extension:
+    ``mx.save_safetensors`` dispatches on it and fails with a bare
+    ``FileNotFoundError`` on any other name.
+    """
+    tmp = target.with_name(f"{target.stem}.{uuid4().hex[:8]}.tmp{target.suffix}")
+    try:
+        write(tmp)
+        tmp.replace(target)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def _write_cache(
     weights: dict[str, mx.array], out: Path, manifest: Mapping[str, object]
 ) -> None:
-    """Write *weights* then its manifest, so a crash leaves no valid cache."""
-    tmp = out.with_suffix(".tmp.safetensors")
-    mx.save_safetensors(str(tmp), weights)
-    tmp.replace(out)
-    _manifest_path(out).write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    """Publish *weights* then its manifest, so a crash leaves no valid cache.
+
+    That order because :func:`_cache_hit` gates on the manifest: a reader
+    arriving between the two sees weights it will not trust, which costs a
+    reconversion. The reverse order would hand it a manifest vouching for
+    weights that are not there yet.
+    """
+    _publish(out, lambda tmp: mx.save_safetensors(str(tmp), weights))
+    _publish(
+        _manifest_path(out),
+        lambda tmp: tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True)),
+    )
 
 
 def dit_cache_path(cache_name: str, revision: str, precision: str) -> Path:
@@ -184,33 +235,38 @@ def convert_dit(
     if _cache_hit(out, manifest) and not force:
         return out
 
-    out.parent.mkdir(parents=True, exist_ok=True)
+    with _cache_lock(out):
+        # Whoever held the lock while we waited may have just written exactly
+        # this cache, in which case converting again would only rewrite it.
+        if _cache_hit(out, manifest) and not force:
+            return out
 
-    weights: dict[str, mx.array] = {}
-    shards = _shard_files(snapshot.path)
-    for shard in tqdm(shards, desc=f"Converting DiT -> {precision}", unit="shard"):
-        source = mx.load(str(shard))
-        for key, value in source.items():
-            if key == NULL_COND_KEY:
-                weights[NULL_COND_KEY] = value.astype(dtype)
-                continue
-            mapped = _convert_dit_key(key)
-            if mapped is None:
-                continue
-            new_key, layout = mapped
-            weights[new_key] = _apply_layout(value, layout).astype(dtype)
-        # Materialise this shard's conversions before dropping the source dict,
-        # so the fp32 buffers are released before the next shard is opened.
-        mx.eval(list(weights.values()))
-        del source
-        mx.clear_cache()
+        weights: dict[str, mx.array] = {}
+        shards = _shard_files(snapshot.path)
+        for shard in tqdm(shards, desc=f"Converting DiT -> {precision}", unit="shard"):
+            source = mx.load(str(shard))
+            for key, value in source.items():
+                if key == NULL_COND_KEY:
+                    weights[NULL_COND_KEY] = value.astype(dtype)
+                    continue
+                mapped = _convert_dit_key(key)
+                if mapped is None:
+                    continue
+                new_key, layout = mapped
+                weights[new_key] = _apply_layout(value, layout).astype(dtype)
+            # Materialise this shard's conversions before dropping the source
+            # dict, so the fp32 buffers are released before the next shard is
+            # opened.
+            mx.eval(list(weights.values()))
+            del source
+            mx.clear_cache()
 
-    if NULL_COND_KEY not in weights:
-        raise RuntimeError(
-            f"{NULL_COND_KEY!r} missing from {snapshot.path}; CFG cannot be built."
-        )
+        if NULL_COND_KEY not in weights:
+            raise RuntimeError(
+                f"{NULL_COND_KEY!r} missing from {snapshot.path}; CFG cannot be built."
+            )
 
-    _write_cache(weights, out, manifest)
+        _write_cache(weights, out, manifest)
     return out
 
 
@@ -254,33 +310,38 @@ def convert_vae(base: Snapshot, force: bool = False) -> Path:
     }
     if _cache_hit(out, manifest) and not force:
         return out
-    out.parent.mkdir(parents=True, exist_ok=True)
 
-    vae_dir = base.path / "vae"
-    source = mx.load(str(vae_dir / "diffusion_pytorch_model.safetensors"))
-    weights: dict[str, mx.array] = {}
-    for key in tqdm(sorted(source), desc="Converting VAE", unit="tensor"):
-        if key.endswith(".weight_v"):
-            continue  # consumed with its .weight_g partner
-        if key.endswith(".weight_g"):
-            base = key[: -len(".weight_g")]
-            v_key = base + ".weight_v"
-            if v_key not in source:
-                raise RuntimeError(f"{key} has no matching {v_key}")
-            w = _fuse_weight_norm(source[key], source[v_key])
-            # conv_t1 is the only ConvTranspose1d in this model.
-            w = (
-                mx.transpose(w, (1, 2, 0))
-                if "conv_t1" in base
-                else mx.swapaxes(w, 1, 2)
-            )
-            weights[base + ".weight"] = w
-        elif key.endswith((".alpha", ".beta")):
-            # Snake1d params: [1, C, 1] -> [C]
-            weights[key] = source[key].astype(mx.float32).squeeze()
-        else:
-            weights[key] = source[key].astype(mx.float32)
-    mx.eval(list(weights.values()))
+    with _cache_lock(out):
+        if _cache_hit(out, manifest) and not force:
+            return out
 
-    _write_cache(weights, out, manifest)
+        vae_dir = base.path / "vae"
+        source = mx.load(str(vae_dir / "diffusion_pytorch_model.safetensors"))
+        weights: dict[str, mx.array] = {}
+        for key in tqdm(sorted(source), desc="Converting VAE", unit="tensor"):
+            if key.endswith(".weight_v"):
+                continue  # consumed with its .weight_g partner
+            if key.endswith(".weight_g"):
+                # Not `base`: that is the Snapshot, and the loop now runs
+                # inside a block that still needs it.
+                stem = key[: -len(".weight_g")]
+                v_key = stem + ".weight_v"
+                if v_key not in source:
+                    raise RuntimeError(f"{key} has no matching {v_key}")
+                w = _fuse_weight_norm(source[key], source[v_key])
+                # conv_t1 is the only ConvTranspose1d in this model.
+                w = (
+                    mx.transpose(w, (1, 2, 0))
+                    if "conv_t1" in stem
+                    else mx.swapaxes(w, 1, 2)
+                )
+                weights[stem + ".weight"] = w
+            elif key.endswith((".alpha", ".beta")):
+                # Snake1d params: [1, C, 1] -> [C]
+                weights[key] = source[key].astype(mx.float32).squeeze()
+            else:
+                weights[key] = source[key].astype(mx.float32)
+        mx.eval(list(weights.values()))
+
+        _write_cache(weights, out, manifest)
     return out
