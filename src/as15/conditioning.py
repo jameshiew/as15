@@ -44,6 +44,12 @@ SFT_GEN_PROMPT = """# Instruction
 # Reference-audio window used when no reference audio is supplied.
 SILENCE_REFER_FRAMES = 750
 
+# What the two conditioning streams fit, in Qwen3 tokens. Upstream passes
+# these as `max_length` with `truncation=True`; they are the lengths the
+# condition encoder was trained against, so they cannot simply be raised.
+MAX_PROMPT_TOKENS = 256
+MAX_LYRIC_TOKENS = 2048
+
 # Chunk mask for whole-song text2music: every frame is generated.
 #
 # Upstream's "auto" mode looks like it writes 2.0 into the mask
@@ -71,6 +77,36 @@ def format_metas(
 
 def format_lyrics(lyrics: str, language: str) -> str:
     return f"# Languages\n{language}\n\n# Lyric\n{lyrics}<|endoftext|>"
+
+
+class InputTooLong(ValueError):
+    """Conditioning input longer than the encoder reads."""
+
+
+def check_token_budget(what: str, text: str, tokens: int, limit: int) -> None:
+    """Reject input the encoder would only ever see the start of.
+
+    Upstream tokenises with ``truncation=True``, so a caption or a lyric sheet
+    over budget is silently cut and the run succeeds: the song comes back
+    missing its last verses, and nothing in the output says so. The full
+    strings are still on ``Conditioning``, so even a debug print of what was
+    conditioned on shows the whole input.
+
+    The character figure is an estimate -- it assumes the rest of *text*
+    tokenises at the same rate as the part measured -- and is there because
+    nobody can eyeball where 263 tokens ends in their lyrics.
+
+    Raises:
+        InputTooLong: naming the stream, its size and the budget.
+    """
+    if tokens <= limit:
+        return
+    over = tokens - limit
+    raise InputTooLong(
+        f"{what} is {tokens} tokens; the conditioning encoder reads at most "
+        f"{limit}. Cut about {over} tokens (~{round(over * len(text) / tokens)} "
+        f"characters)."
+    )
 
 
 @dataclass
@@ -184,12 +220,27 @@ class Conditioner:
         text_prompt = SFT_GEN_PROMPT.format(instruction, style_prompt, metas)
         lyrics_text = format_lyrics(lyrics, language)
 
-        text = self.tokenizer(
-            text_prompt, truncation=True, max_length=256, return_tensors="pt"
+        # Tokenised without `truncation=True`, so that over-budget input can be
+        # rejected below instead of quietly becoming a shorter song. For input
+        # that fits, this is the same tensor the truncating call returned:
+        # truncation only rewrites an encoding once it is longer than
+        # max_length, verified at the boundary (256 tokens in, 256 out,
+        # identical ids; 257 in, 256 out, last token replaced).
+        text = self.tokenizer(text_prompt, return_tensors="pt")
+        lyric = self.tokenizer(lyrics_text, return_tensors="pt")
+        check_token_budget(
+            "the style prompt (with the instruction and metas lines)",
+            text_prompt,
+            text.input_ids.shape[1],
+            MAX_PROMPT_TOKENS,
         )
-        lyric = self.tokenizer(
-            lyrics_text, truncation=True, max_length=2048, return_tensors="pt"
+        check_token_budget(
+            "the lyric sheet (with the language header)",
+            lyrics_text,
+            lyric.input_ids.shape[1],
+            MAX_LYRIC_TOKENS,
         )
+
         text_ids = text.input_ids.to(self.device)
         lyric_ids = lyric.input_ids.to(self.device)
         text_mask = text.attention_mask.to(self.device).bool()

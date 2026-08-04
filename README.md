@@ -76,6 +76,11 @@ Neon rivers start to flow
 Hold me in the afterglow
 ```
 
+Conditioning has a fixed budget: **256 tokens** for the style prompt (shared with
+the instruction and metadata lines it is wrapped in, ~54 of them) and **2048** for
+the lyrics. Over that is rejected, saying how much to cut — upstream truncates
+instead, which returns a song missing its last verses and does not mention it.
+
 Useful options:
 
 | Flag | Default | Notes |

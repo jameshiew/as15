@@ -178,7 +178,21 @@ def sing(
         err=True,
     )
 
-    result = generate(spec, request, device=device, progress=not quiet)
+    # Imported here rather than at the top of the module: as15.conditioning
+    # pulls in torch, and `as15 models` should not pay for that.
+    from .conditioning import InputTooLong
+
+    # Only the tokenizer can tell whether the prompt and lyrics fit, and it
+    # loads with the conditioner, so this is the one bad-input case that
+    # survives past the banner. Reported as an error rather than raised as a
+    # usage error, which would print the whole help text underneath the
+    # settings we just listed.
+    try:
+        result = generate(spec, request, device=device, progress=not quiet)
+    except InputTooLong as exc:
+        _err(str(exc))
+        raise typer.Exit(2) from None
+
     write_audio(out, result.audio, result.sample_rate)
 
     t = result.timings

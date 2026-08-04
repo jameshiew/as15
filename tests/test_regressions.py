@@ -10,6 +10,7 @@ import fcntl
 import itertools
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 import numpy as np
@@ -597,6 +598,116 @@ def test_the_cli_accepts_the_smallest_valid_step_count(monkeypatch, tmp_path):
     assert result.exit_code == 0, result.output
     assert seen["request"].steps == 1
     assert seen["request"].shift == 2.0
+
+
+# --- conditioning token budget -------------------------------------------
+
+
+class _CharTokenizer:
+    """A tokenizer whose tokens are characters -- only the count matters.
+
+    Records how it was called, so the tests can also assert on what was *not*
+    asked for.
+    """
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def __call__(self, text: str, **kwargs):
+        self.calls.append(kwargs)
+        ids = np.zeros((1, len(text)), dtype=np.int64)
+        return SimpleNamespace(input_ids=ids, attention_mask=ids)
+
+
+def _conditioner_with(tokenizer) -> conditioning.Conditioner:
+    """A Conditioner holding a tokenizer and nothing else.
+
+    Built with ``__new__``, so it has no models: reaching the end of the
+    budget check would raise AttributeError rather than pass, which is the
+    other half of what these tests pin -- input is rejected before the 1.2 B
+    torch parameters are run, not after.
+    """
+    conditioner = conditioning.Conditioner.__new__(conditioning.Conditioner)
+    conditioner.tokenizer = tokenizer
+    return conditioner
+
+
+def test_lyrics_the_encoder_cannot_read_are_rejected_not_truncated():
+    """Upstream tokenises with ``truncation=True``.
+
+    Lyrics over budget were cut there, and the run then succeeded: the song
+    came back missing its last verses with nothing to say so, at the full cost
+    of a generation. ``Conditioning.lyrics_text`` kept the whole sheet, so even
+    printing what was conditioned on showed the input intact.
+    """
+    tokenizer = _CharTokenizer()
+
+    with pytest.raises(conditioning.InputTooLong, match="lyric sheet"):
+        _conditioner_with(tokenizer).build(
+            style_prompt="dream pop", lyrics="l" * 4000, duration=30.0
+        )
+
+    assert tokenizer.calls, "the budget was checked without tokenising"
+    assert all("truncation" not in kwargs for kwargs in tokenizer.calls)
+
+
+def test_a_style_prompt_the_encoder_cannot_read_is_rejected():
+    """The caption shares its 256 tokens with the instruction and metas lines.
+
+    So the budget is smaller than it looks, and the message has to count what
+    the encoder counts rather than what the user typed.
+    """
+    with pytest.raises(conditioning.InputTooLong, match="style prompt"):
+        _conditioner_with(_CharTokenizer()).build(
+            style_prompt="p" * 400, lyrics="", duration=30.0
+        )
+
+
+@pytest.mark.parametrize("tokens", [0, 1, 255, 256])
+def test_input_that_fits_is_left_alone(tokens):
+    """The bound must not reject input the encoder reads in full."""
+    conditioning.check_token_budget("the style prompt", "x" * tokens, tokens, 256)
+
+
+def test_the_rejection_says_how_much_to_cut():
+    """Nobody can eyeball where 2048 tokens ends in their lyrics."""
+    with pytest.raises(conditioning.InputTooLong) as exc:
+        conditioning.check_token_budget("the lyrics", "y" * 4000, 2200, 2048)
+
+    message = str(exc.value)
+    assert "2200 tokens" in message
+    assert "2048" in message
+    assert "152 tokens" in message  # 2200 - 2048
+    assert "276 characters" in message  # 152 of 2200 tokens, at 4000 characters
+
+
+def test_the_budgets_are_the_lengths_upstream_tokenises_to():
+    """These are trained lengths, not a limit this port chose."""
+    assert conditioning.MAX_PROMPT_TOKENS == 256
+    assert conditioning.MAX_LYRIC_TOKENS == 2048
+
+
+def test_the_cli_reports_input_it_cannot_condition_on(monkeypatch):
+    """Only the tokenizer can catch this, and it loads with the conditioner.
+
+    So it is the one bad-input case that gets past the option checks, and it
+    has to land as an error rather than as a traceback.
+    """
+    from typer.testing import CliRunner
+
+    from as15 import cli
+
+    def too_long(*args, **kwargs):
+        raise conditioning.InputTooLong("the lyrics ... is 2200 tokens")
+
+    monkeypatch.setattr(cli, "generate", too_long)
+    monkeypatch.setattr(cli, "write_audio", lambda *args: None)
+
+    result = CliRunner().invoke(cli.app, ["sing", "-p", "x", "-l", "y"])
+
+    assert result.exit_code == 2
+    assert "2200 tokens" in result.stderr
+    assert result.exception is None or isinstance(result.exception, SystemExit)
 
 
 # --- stage cleanup -------------------------------------------------------
