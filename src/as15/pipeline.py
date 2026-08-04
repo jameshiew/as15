@@ -169,6 +169,11 @@ def generate(
         # forcing CFG on them doubles cost and degrades output.
         guidance = 1.0
 
+    # The peak counter is process-global and never decays, so a second
+    # generate() in the same process would otherwise report whichever earlier
+    # call -- or the weight conversion -- happened to allocate the most.
+    mx.reset_peak_memory()
+
     # --- Conditioning (PyTorch), released before the DiT is loaded ----------
     t0 = time.time()
     dit_snapshot, base_snapshot = _resolve_snapshots(spec)
