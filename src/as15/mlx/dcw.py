@@ -3,9 +3,14 @@
 Vendored from ACE-Step 1.5 (``acestep.models.mlx.dcw_correction_mlx``) and
 reduced to the native Haar path.  Upstream also offers ``db2``/``db4``/
 ``sym4``/``sym8``/``coif2`` via a per-step ``mx.array -> torch -> mx.array``
-bridge into ``pytorch_wavelets``; that bridge is dropped here so the runtime
-stays free of torch.  Haar is the upstream default and the only basis whose
+bridge into ``pytorch_wavelets``; that bridge is dropped here so the per-step
+path stays MLX-only.  Haar is the upstream default and the only basis whose
 MLX implementation is exact.
+
+Upstream's ``low``/``high``/``pix`` modes go with it.  ``double`` is its
+default and the only one anything here ever selected, and the mode arrived as
+a free-form string that was validated -- when it was validated at all -- deep
+inside the diffusion loop.
 """
 
 from __future__ import annotations
@@ -14,7 +19,10 @@ import math
 
 import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 
-VALID_DCW_MODES = ("low", "high", "double", "pix")
+# Correction strengths, from upstream's defaults.  The two bands are weighted
+# in opposite directions along the schedule -- see :func:`apply_mlx_dcw`.
+DCW_SCALER = 0.05
+DCW_HIGH_SCALER = 0.02
 
 
 def _haar_dwt_1d(x: mx.array):
@@ -43,63 +51,27 @@ def _haar_idwt_1d(low: mx.array, high: mx.array, out_T: int) -> mx.array:
     return reconstructed[:, :out_T, :]
 
 
-def apply_mlx_dcw(
-    x_next: mx.array,
-    denoised: mx.array,
-    t_curr: float,
-    enabled: bool,
-    mode: str = "double",
-    scaler: float = 0.05,
-    high_scaler: float = 0.02,
-) -> mx.array:
+def apply_mlx_dcw(x_next: mx.array, denoised: mx.array, t_curr: float) -> mx.array:
     """Push ``x_next``'s frequency bands away from the predicted clean sample.
 
-    The scaler decays with ``t_curr``, so this is identity at ``t=0`` and
-    strongest at ``t~=1``.
+    The low band is weighted by ``t*DCW_SCALER`` and the high band by
+    ``(1-t)*DCW_HIGH_SCALER``, so the correction moves from coarse structure at
+    the top of the schedule to detail as the trajectory lands.
     """
-    if not enabled:
-        return x_next
-
-    # Per-mode schedule: low decays with t, high is complementary (weak at
-    # high noise, strong near t->0), pix uses the raw scaler.
     t = float(t_curr)
-    raw_low = float(scaler)
-    raw_high = float(high_scaler)
-    low_s = t * raw_low
-    high_s = (1.0 - t) * raw_low
-    double_high_s = (1.0 - t) * raw_high
-
-    if mode == "pix":
-        if raw_low == 0.0:
-            return x_next
-        return x_next + raw_low * (x_next - denoised)
-
-    if mode == "low":
-        if low_s == 0.0:
-            return x_next
-    elif mode == "high":
-        if high_s == 0.0:
-            return x_next
-    elif mode == "double":
-        if low_s == 0.0 and double_high_s == 0.0:
-            return x_next
-    else:
-        raise ValueError(
-            f"Invalid dcw_mode={mode!r}. Expected one of {VALID_DCW_MODES}."
-        )
+    low_s = t * DCW_SCALER
+    high_s = (1.0 - t) * DCW_HIGH_SCALER
 
     T_out = x_next.shape[1]
     xL, xH = _haar_dwt_1d(x_next)
     yL, yH = _haar_dwt_1d(denoised)
 
-    if mode == "low":
+    # Each weight is exactly zero at one end of the schedule -- the high band at
+    # t=1, which is the first step of every run -- so skip the band rather than
+    # add a zero to it.
+    if low_s != 0.0:
         xL = xL + low_s * (xL - yL)
-    elif mode == "high":
+    if high_s != 0.0:
         xH = xH + high_s * (xH - yH)
-    else:  # double
-        if low_s != 0.0:
-            xL = xL + low_s * (xL - yL)
-        if double_high_s != 0.0:
-            xH = xH + double_high_s * (xH - yH)
 
     return _haar_idwt_1d(xL, xH, T_out)

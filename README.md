@@ -145,4 +145,7 @@ use permitted — check the model card yourself before shipping anything.
 
 The MLX DiT, VAE, DCW and sampler modules under `src/as15/mlx/` are vendored from
 ACE-Step 1.5 (MIT) and adapted: repo coupling removed, the `pytorch_wavelets`
-bridge dropped for pure-MLX Haar, and a compute-dtype option added.
+bridge dropped for pure-MLX Haar, a compute-dtype option added, and the sampler
+branches nothing here can reach — cover switching, repaint, retake, `mx.compile`,
+explicit timestep lists, velocity clamping and EMA — deleted rather than left
+unvalidated.
