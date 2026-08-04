@@ -193,6 +193,16 @@ def _mlx_apg_forward(
     return pred_cond + (guidance_scale - 1) * orthogonal
 
 
+def _mlx_cfg_forward(pred_cond, pred_uncond, guidance_scale: float):
+    """Plain classifier-free guidance -- mirrors upstream's ``cfg_forward``.
+
+    The Heun corrector guides through this rather than through APG: it is a
+    second evaluation *within* one step, and APG's momentum recurrence has to
+    advance once per step.
+    """
+    return pred_uncond + guidance_scale * (pred_cond - pred_uncond)
+
+
 def _mlx_repaint_step_injection(xt, clean_src, mask, t_next, noise):
     """Replace non-repaint regions of *xt* with noised source latents (MLX)."""
     import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
@@ -462,8 +472,8 @@ def mlx_generate_diffusion(
         )
         return vt_out, step_cache
 
-    def _apply_cfg(vt_raw, current_t_val):
-        """Apply CFG guidance if enabled."""
+    def _apply_predictor_cfg(vt_raw, current_t_val):
+        """Guide the predictor evaluation: APG, advancing the momentum state."""
         if not do_cfg:
             return vt_raw
         pred_cond = vt_raw[:bsz]
@@ -472,6 +482,22 @@ def mlx_generate_diffusion(
             return _mlx_apg_forward(
                 pred_cond, pred_uncond, guidance_scale, momentum_state
             )
+        return pred_cond
+
+    def _apply_corrector_cfg(vt_raw, current_t_val):
+        """Guide the Heun corrector evaluation: plain CFG, no state.
+
+        Routing the corrector through APG would step the momentum recurrence
+        twice per interval, so from the second step onwards the running
+        average -- and every guided velocity derived from it -- diverges from
+        the reference. Upstream splits the two for the same reason.
+        """
+        if not do_cfg:
+            return vt_raw
+        pred_cond = vt_raw[:bsz]
+        pred_uncond = vt_raw[bsz:]
+        if cfg_interval_start <= current_t_val <= cfg_interval_end:
+            return _mlx_cfg_forward(pred_cond, pred_uncond, guidance_scale)
         return pred_cond
 
     def _apply_stabilisation(vt_guided, xt_current, prev_velocity):
@@ -517,11 +543,16 @@ def mlx_generate_diffusion(
             dcw_high_scaler,
         )
 
-    for step_idx in tqdm(
-        range(num_steps), desc="MLX DiT diffusion", disable=disable_tqdm
-    ):
-        current_t = t_schedule_list[step_idx]
+    # The schedule carries no trailing zero, so pair every timestep with its
+    # successor and close the last interval at t=0. Upstream iterates
+    # ``zip(t[:-1], t[1:])`` over a schedule that ends at zero, which gives the
+    # final interval the same treatment as the rest; special-casing it as a bare
+    # Euler hop to zero drops the corrector evaluation that Heun owes it.
+    step_pairs = list(zip(t_schedule_list, [*t_schedule_list[1:], 0.0], strict=True))
 
+    for step_idx, (current_t, next_t) in enumerate(
+        tqdm(step_pairs, desc="MLX DiT diffusion", disable=disable_tqdm)
+    ):
         # Switch to non-cover conditions when appropriate
         if step_idx >= cover_steps and not _switched_to_non_cover:
             _switched_to_non_cover = True
@@ -538,7 +569,7 @@ def mlx_generate_diffusion(
         vt, cache = _model_eval(x_in, current_t, enc_hs, ctx, cache)
         mx.eval(vt)
 
-        vt = _apply_cfg(vt, current_t)
+        vt = _apply_predictor_cfg(vt, current_t)
         vt = _apply_stabilisation(vt, xt, prev_vt)
 
         # Cache pre-step latent so DCW can reconstruct the predicted clean
@@ -549,49 +580,49 @@ def mlx_generate_diffusion(
         xt_before_step = xt
         vt_for_denoise = vt
 
-        # Final step: compute x0
-        if step_idx == num_steps - 1:
+        # Step size of this interval. Named ``delta``, not ``dt``: ``dt`` is the
+        # compute dtype, and the SDE branch below casts with it.
+        delta = current_t - next_t
+
+        if use_heun and infer_method == "ode":
+            # ---- Heun (second-order) ODE step ----
+            # Predictor: Euler step to get xt_predicted at next_t
+            delta_arr = mx.full((bsz, 1, 1), delta)
+            xt_predicted = xt - vt * delta_arr
+            mx.eval(xt_predicted)
+
+            # Corrector: evaluate model at the predicted point
+            x_in2 = (
+                mx.concatenate([xt_predicted, xt_predicted], axis=0)
+                if do_cfg
+                else xt_predicted
+            )
+            vt2, cache = _model_eval(x_in2, next_t, enc_hs, ctx, cache)
+            mx.eval(vt2)
+            vt2 = _apply_corrector_cfg(vt2, next_t)
+            vt2 = _apply_stabilisation(vt2, xt_predicted, vt)
+
+            # Average the two velocity predictions (trapezoidal rule)
+            vt_avg = 0.5 * (vt + vt2)
+            xt = xt - vt_avg * delta_arr
+            vt = vt_avg  # store averaged velocity for EMA
+        elif infer_method == "sde":
             t_unsq = mx.full((bsz, 1, 1), current_t)
-            xt = xt - vt * t_unsq
-            mx.eval(xt)
-        else:
-            next_t = t_schedule_list[step_idx + 1]
-
-            if use_heun and infer_method == "ode":
-                # ---- Heun (second-order) ODE step ----
-                # Predictor: Euler step to get xt_predicted at next_t
-                dt = current_t - next_t
-                dt_arr = mx.full((bsz, 1, 1), dt)
-                xt_predicted = xt - vt * dt_arr
-                mx.eval(xt_predicted)
-
-                # Corrector: evaluate model at the predicted point
-                x_in2 = (
-                    mx.concatenate([xt_predicted, xt_predicted], axis=0)
-                    if do_cfg
-                    else xt_predicted
-                )
-                vt2, cache = _model_eval(x_in2, next_t, enc_hs, ctx, cache)
-                mx.eval(vt2)
-                vt2 = _apply_cfg(vt2, next_t)
-                vt2 = _apply_stabilisation(vt2, xt_predicted, vt)
-
-                # Average the two velocity predictions (trapezoidal rule)
-                vt_avg = 0.5 * (vt + vt2)
-                xt = xt - vt_avg * dt_arr
-                vt = vt_avg  # store averaged velocity for EMA
-            elif infer_method == "sde":
-                t_unsq = mx.full((bsz, 1, 1), current_t)
-                pred_clean = xt - vt * t_unsq
+            pred_clean = xt - vt * t_unsq
+            # next_t == 0 on the last interval: the blend is then all clean
+            # sample, so skip the draw rather than scale it away -- MLX's
+            # implicit PRNG state would advance for nothing.
+            if next_t > 0.0:
                 new_noise = mx.random.normal(xt.shape).astype(dt)
                 xt = next_t * new_noise + (1.0 - next_t) * pred_clean
             else:
-                # ---- Standard Euler ODE step ----
-                dt = current_t - next_t
-                dt_arr = mx.full((bsz, 1, 1), dt)
-                xt = xt - vt * dt_arr
+                xt = pred_clean
+        else:
+            # ---- Standard Euler ODE step ----
+            delta_arr = mx.full((bsz, 1, 1), delta)
+            xt = xt - vt * delta_arr
 
-            mx.eval(xt)
+        mx.eval(xt)
 
         # DCW correction -- push x_next's frequency bands away from the
         # predicted clean sample.  Scaler decays with t_curr so this is
@@ -616,11 +647,8 @@ def mlx_generate_diffusion(
         if do_repaint:
             injection_cutoff = round(repaint_injection_ratio * num_steps)
             if step_idx < injection_cutoff:
-                t_after = (
-                    t_schedule_list[step_idx + 1] if step_idx < num_steps - 1 else 0.0
-                )
                 xt = _mlx_repaint_step_injection(
-                    xt, clean_src_mx, repaint_mask_mx, t_after, noise
+                    xt, clean_src_mx, repaint_mask_mx, next_t, noise
                 )
                 mx.eval(xt)
 

@@ -94,6 +94,154 @@ def test_apg_without_momentum_is_stateless():
     assert np.array_equal(np.array(a), np.array(b))
 
 
+# --- sampler stepping ----------------------------------------------------
+
+
+class _ConstantDecoder:
+    """Stand-in for the DiT that records the timestep of every evaluation.
+
+    Predicts a velocity of 1.0, offset by batch row so that the conditional
+    and unconditional halves of a CFG batch differ.
+    """
+
+    def __init__(self) -> None:
+        self.timesteps: list[float] = []
+
+    def __call__(
+        self,
+        *,
+        hidden_states,
+        timestep,
+        timestep_r,
+        encoder_hidden_states,
+        context_latents,
+        cache,
+        use_cache,
+    ):
+        self.timesteps.append(float(np.array(timestep)[0]))
+        rows = mx.arange(hidden_states.shape[0]).reshape(-1, 1, 1)
+        return mx.ones_like(hidden_states) + 0.1 * rows, cache
+
+
+# shift=1.0 and infer_steps=3 give the schedule [1, 2/3, 1/3]; the interval
+# that ends at t=0 is the one the loop used to special-case.
+SCHEDULE = [1.0, 2 / 3, 1 / 3]
+STEPS = len(SCHEDULE)
+NOISE_SHAPE = (1, 4, 8)
+
+
+def _run_sampler(decoder, **kwargs):
+    from as15.mlx.sampler import mlx_generate_diffusion
+
+    b, t, c = NOISE_SHAPE
+    return mlx_generate_diffusion(
+        decoder,
+        encoder_hidden_states_np=np.zeros((b, 3, 6), dtype=np.float32),
+        context_latents_np=np.zeros((b, t, c), dtype=np.float32),
+        src_latents_shape=NOISE_SHAPE,
+        seed=0,
+        infer_steps=STEPS,
+        shift=1.0,
+        dcw_enabled=False,
+        disable_tqdm=True,
+        compute_dtype="float32",
+        **kwargs,
+    )
+
+
+def _cfg_kwargs():
+    return {
+        "guidance_scale": 7.0,
+        "null_condition_emb_np": np.zeros((1, 1, 6), dtype=np.float32),
+    }
+
+
+def test_heun_corrects_the_interval_that_ends_at_zero():
+    """The last interval used to be a bare Euler hop to t=0.
+
+    Upstream pairs ``zip(t[:-1], t[1:])`` over a schedule ending at zero, so
+    every interval gets a corrector. Dropping the last one left an N-step Heun
+    run at 2N-1 evaluations, first-order exactly where the trajectory lands on
+    the clean sample.
+    """
+    decoder = _ConstantDecoder()
+    _run_sampler(decoder, sampler_mode="heun")
+
+    # Predictor at t_curr, corrector at t_next, for every interval.
+    assert np.allclose(
+        decoder.timesteps,
+        [1.0, 2 / 3, 2 / 3, 1 / 3, 1 / 3, 0.0],
+    )
+    assert len(decoder.timesteps) == 2 * STEPS
+
+
+def test_heun_advances_the_apg_momentum_once_per_interval(monkeypatch):
+    """The corrector guides through plain CFG, not APG.
+
+    Both evaluations used to run the stateful APG path, so the momentum
+    recurrence stepped twice per interval and desynchronised from the
+    reference after the first step.
+    """
+    from as15.mlx import sampler
+
+    apg_calls: list[dict | None] = []
+    real_apg = sampler._mlx_apg_forward
+    cfg_calls: list[float] = []
+    real_cfg = sampler._mlx_cfg_forward
+
+    def spy_apg(pred_cond, pred_uncond, guidance_scale, momentum_state=None, **kw):
+        apg_calls.append(momentum_state)
+        return real_apg(pred_cond, pred_uncond, guidance_scale, momentum_state, **kw)
+
+    def spy_cfg(pred_cond, pred_uncond, guidance_scale):
+        cfg_calls.append(guidance_scale)
+        return real_cfg(pred_cond, pred_uncond, guidance_scale)
+
+    monkeypatch.setattr(sampler, "_mlx_apg_forward", spy_apg)
+    monkeypatch.setattr(sampler, "_mlx_cfg_forward", spy_cfg)
+
+    _run_sampler(_ConstantDecoder(), sampler_mode="heun", **_cfg_kwargs())
+
+    assert len(apg_calls) == STEPS
+    assert all(state is not None for state in apg_calls)
+    assert len(cfg_calls) == STEPS
+
+
+def test_the_last_interval_still_lands_on_x0():
+    """Euler is unchanged by pairing the last interval with t=0.
+
+    The step size there is ``t_last - 0``, so the update stays ``x - v*t``:
+    with v == 1 the schedule telescopes to ``noise - t_0``.
+    """
+    decoder = _ConstantDecoder()
+    result = _run_sampler(decoder, sampler_mode="euler")
+
+    assert np.allclose(decoder.timesteps, SCHEDULE)
+    noise = np.array(mx.random.normal(NOISE_SHAPE, key=mx.random.key(0)))
+    assert np.allclose(result["target_latents"], noise - SCHEDULE[0], atol=1e-5)
+
+
+def test_sde_draws_no_noise_for_the_interval_that_ends_at_zero(monkeypatch):
+    """``t_next == 0`` scales the fresh noise away, so it must not be drawn.
+
+    Drawing it anyway would advance MLX's implicit PRNG state once per
+    generation for nothing.
+    """
+    real_normal = mx.random.normal
+    keyless = []
+
+    def spy(shape, *args, key=None, **kw):
+        if key is None:
+            keyless.append(shape)
+        return real_normal(shape, *args, key=key, **kw)
+
+    monkeypatch.setattr(mx.random, "normal", spy)
+
+    _run_sampler(_ConstantDecoder(), infer_method="sde")
+
+    assert len(keyless) == STEPS - 1
+
+
 # --- weight conversion layout -------------------------------------------
 
 
