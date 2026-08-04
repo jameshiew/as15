@@ -64,6 +64,8 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 Use the model actually doing the work. Do not add any other generated-by
 marker, and do not put the trailer on commits the agent did not touch.
 
+Commits by agents should not be signed.
+
 ### Scope
 
 One logical change per commit. Mechanical churn (a formatter pass, a lockfile
@@ -76,5 +78,5 @@ already covers them.
 
 ### Branching
 
-Work on a branch off `main`, not on `main` directly. Commit only when asked to,
-and push only when asked to.
+It's fine to commit directly to `main`, and it's fine to commit proactively
+without being asked. Push only when asked to.
