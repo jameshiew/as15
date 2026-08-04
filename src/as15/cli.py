@@ -155,7 +155,15 @@ def sing(
         str, typer.Option("--device", help="Torch device for conditioning.")
     ] = "auto",
     quiet: Annotated[
-        bool, typer.Option("--quiet", "-q", help="No progress bar.")
+        bool,
+        typer.Option(
+            "--quiet",
+            "-q",
+            # Only the diffusion bar. A cold cache still reports its download
+            # (huggingface_hub's own bars) and its conversion, both of which
+            # are minutes of apparent silence otherwise.
+            help="No diffusion progress bar.",
+        ),
     ] = False,
 ) -> None:
     """Generate a song from a style prompt and lyrics."""

@@ -195,7 +195,7 @@ class Conditioner:
         silence = torch.load(
             dit_snapshot / "silence_latent.pt", map_location="cpu", weights_only=True
         )
-        # Stored [1, 64, T]; the handler convention is [1, T, 64].
+        # Stored [1, 64, T]; everything downstream of here is [1, T, 64].
         self.silence_latent = silence.transpose(1, 2).to(self.device, dtype)
 
     def silence_slice(self, frames: int) -> torch.Tensor:

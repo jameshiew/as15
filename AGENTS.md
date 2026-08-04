@@ -58,14 +58,17 @@ independent findings.
 
 ### Trailer
 
-Every commit an agent contributed to ends with a blank line and:
+Every commit an agent contributed to ends with a blank line and a
+`Co-Authored-By:` naming the model that actually did the work -- not a fixed
+name. An agent running as Opus 5 writes:
 
 ```
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 ```
 
-Use the model actually doing the work. Do not add any other generated-by
-marker, and do not put the trailer on commits the agent did not touch.
+and one running as anything else substitutes its own model name. Do not add
+any other generated-by marker, and do not put the trailer on commits the agent
+did not touch.
 
 Commits by agents should not be signed.
 

@@ -200,14 +200,15 @@ def mlx_generate_diffusion(
 ) -> DiffusionResult:
     """Run the complete MLX diffusion loop with optional CFG guidance.
 
-    This is the core generation function.  It accepts numpy arrays (converted
-    from PyTorch tensors by the handler) and returns numpy arrays that the
-    handler converts back to PyTorch.
+    Numpy at the boundary in both directions, and only at the boundary: the
+    conditioning that comes in is the one stage that still runs under torch,
+    and the latents that go out are handed straight back to the MLX VAE.
+    Upstream passes torch tensors here and converts on both sides.
 
     Args:
         mlx_decoder: ``MLXDiTDecoder`` instance with loaded weights.
-        encoder_hidden_states_np: [B, enc_L, D] from prepare_condition (numpy).
-        context_latents_np: [B, T, C] from prepare_condition (numpy).
+        encoder_hidden_states_np: [B, enc_L, D] from ``Conditioner.build``.
+        context_latents_np: [B, T, C] from ``Conditioner.build``.
         src_latents_shape: shape tuple [B, T, 64] for noise generation.
         infer_steps: number of diffusion steps.
         seed: random seed, or None to draw unseeded.

@@ -18,7 +18,7 @@ uv run as15 sing \
 The official [ACE-Step-1.5](https://github.com/ace-step/ACE-Step-1.5) repo works,
 but it is ~92k lines of Python and pulls in gradio, lightning, tensorboard, peft,
 numba, torchcodec, torchao, nano-vllm, modelscope and more. This is a single-purpose
-CLI: **9 runtime dependencies**, no web UI, no training code, no server.
+CLI: **11 runtime dependencies**, no web UI, no training code, no server.
 
 It also fixes three things that bite on Apple Silicon:
 
@@ -169,7 +169,7 @@ use permitted — check the model card yourself before shipping anything.
 
 The MLX DiT, VAE, DCW and sampler modules under `src/as15/mlx/` are vendored from
 ACE-Step 1.5 (MIT) and adapted: repo coupling removed, the `pytorch_wavelets`
-bridge dropped for pure-MLX Haar, a compute-dtype option added, and the sampler
-branches nothing here can reach — cover switching, repaint, retake, `mx.compile`,
-explicit timestep lists, velocity clamping and EMA — deleted rather than left
-unvalidated.
+bridge dropped for pure-MLX Haar, a compute-dtype option added, the VAE encoder
+dropped (generation only ever decodes), and the sampler branches nothing here can
+reach — cover switching, repaint, retake, `mx.compile`, explicit timestep lists,
+velocity clamping and EMA — deleted rather than left unvalidated.
