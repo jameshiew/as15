@@ -298,6 +298,56 @@ def test_a_list_of_seeds_keeps_the_sde_batch_items_independent():
     assert not np.array_equal(both[1], alone[1])
 
 
+# --- repaint -------------------------------------------------------------
+
+
+def _repaint_kwargs(crossfade: int):
+    """A half-masked repaint request over the standard test geometry."""
+    b, t, c = NOISE_SHAPE
+    mask = np.zeros((b, t), dtype=bool)
+    mask[:, : t // 2] = True  # first half regenerates, second half is preserved
+    src = np.arange(b * t * c, dtype=np.float32).reshape(b, t, c)
+    return (
+        mask,
+        src,
+        {
+            "repaint_mask_np": mask,
+            "clean_src_latents_np": src,
+            "repaint_crossfade_frames": crossfade,
+        },
+    )
+
+
+@pytest.mark.parametrize("crossfade", [0, -1])
+def test_a_zero_crossfade_repaint_still_restores_the_source(crossfade):
+    """A zero crossfade means "no ramp", not "no restore".
+
+    Step injection stops at ``repaint_injection_ratio * num_steps``, so the
+    region outside the mask keeps integrating for the rest of the loop. The
+    post-loop blend is what pins it back to the source, and it used to be
+    skipped entirely unless the crossfade was positive -- leaving audio the
+    caller asked to keep untouched drifting by the last few steps.
+    """
+    mask, src, kwargs = _repaint_kwargs(crossfade)
+
+    out = _run_sampler(_ConstantDecoder(), **kwargs)["target_latents"]
+
+    assert np.array_equal(out[:, ~mask[0]], src[:, ~mask[0]])
+    # The masked half is generated, so it must not have been pinned as well.
+    assert not np.array_equal(out[:, mask[0]], src[:, mask[0]])
+
+
+def test_a_positive_crossfade_repaint_ramps_instead_of_pinning():
+    """The ramp still reaches the source outside the crossfade window."""
+    _, src, kwargs = _repaint_kwargs(1)
+
+    out = _run_sampler(_ConstantDecoder(), **kwargs)["target_latents"]
+
+    # T=4, mask=[1,1,0,0]: frame 2 sits in the ramp, frame 3 is pure source.
+    assert not np.array_equal(out[:, 2], src[:, 2])
+    assert np.array_equal(out[:, 3], src[:, 3])
+
+
 # --- input validation ----------------------------------------------------
 
 

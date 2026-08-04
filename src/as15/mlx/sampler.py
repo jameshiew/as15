@@ -760,9 +760,14 @@ def mlx_generate_diffusion(
                 mx.eval(xt)
 
     # ---- Repaint boundary blend (post-loop) ----
-    if do_repaint and repaint_crossfade_frames > 0:
+    # Runs for every repaint, including a zero crossfade: step injection stops
+    # at injection_cutoff, so without this the "untouched" region keeps drifting
+    # for the rest of the loop. With cf_frames <= 0 the blend degenerates to a
+    # hard restore of the source outside the mask, which is what a zero
+    # crossfade means -- not "skip the restore".
+    if do_repaint:
         xt = _mlx_repaint_boundary_blend(
-            xt, clean_src_mx, repaint_mask_np, repaint_crossfade_frames
+            xt, clean_src_mx, repaint_mask_np, max(0, repaint_crossfade_frames)
         )
         mx.eval(xt)
 
