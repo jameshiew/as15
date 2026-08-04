@@ -57,7 +57,7 @@ def sing(
         ),
     ] = None,
     out: Annotated[Path, typer.Option("--out", "-o", help="Output audio file.")] = Path(
-        "song.wav"
+        "song.flac"
     ),
     model: Annotated[
         str, typer.Option("--model", "-m", help=f"One of: {', '.join(MODELS)}.")

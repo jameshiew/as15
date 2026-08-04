@@ -2,7 +2,7 @@
 
 Generate songs with [ACE-Step 1.5 XL](https://huggingface.co/collections/ACE-Step/ace-step-15)
 on Apple Silicon. The 4B diffusion transformer and the audio VAE both run
-natively on **MLX**; you give it a style prompt and lyrics and it writes a wav.
+natively on **MLX**; you give it a style prompt and lyrics and it writes a FLAC.
 
 Built for a 32 GB M-series Mac. A 30 s clip peaks around 9.6 GB.
 
@@ -10,7 +10,7 @@ Built for a 32 GB M-series Mac. A 30 s clip peaks around 9.6 GB.
 uv run as15 sing \
   -p "dream pop, female vocals, shimmering reverb guitars, warm analog tape" \
   -L lyrics.txt \
-  -d 120 -o song.wav
+  -d 120 -o song.flac
 ```
 
 ## Why not just use the upstream repo
