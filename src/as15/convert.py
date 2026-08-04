@@ -23,7 +23,27 @@ from tqdm import tqdm
 
 from .models import Snapshot, cache_root
 
-DTYPES = {"bf16": mx.bfloat16, "fp32": mx.float32}
+# Precision labels, mapped to the ``mlx.core`` dtype name they select. Names
+# rather than dtype objects: the sampler takes its compute dtype as a string
+# and resolves it with getattr, so one table serves both and the two cannot
+# drift apart.
+PRECISIONS = {"bf16": "bfloat16", "fp32": "float32"}
+
+
+def resolve_precision(precision: str) -> str:
+    """Return the ``mlx.core`` dtype name for *precision*.
+
+    Indexing :data:`PRECISIONS` directly surfaces a bare ``KeyError`` from
+    wherever the label is first used, which for ``as15 download --precision
+    typo`` was a traceback out of the converter rather than a usage error.
+    """
+    try:
+        return PRECISIONS[precision]
+    except KeyError:
+        raise ValueError(
+            f"Unknown precision {precision!r}. Choose one of: {', '.join(PRECISIONS)}"
+        ) from None
+
 
 # Emitted alongside the DiT weights; needed to build the CFG null branch.
 NULL_COND_KEY = "null_condition_emb"
@@ -149,6 +169,10 @@ def convert_dit(
 
     Returns the path to the cached safetensors file.
     """
+    # Before the cache path is built: an unknown label would otherwise name a
+    # file that can never hit, and only fail once the conversion reached it.
+    dtype = getattr(mx, resolve_precision(precision))
+
     out = dit_cache_path(snapshot.cache_name, snapshot.revision, precision)
     manifest: dict[str, object] = {
         "asset": "dit",
@@ -160,7 +184,6 @@ def convert_dit(
     if _cache_hit(out, manifest) and not force:
         return out
 
-    dtype = DTYPES[precision]
     out.parent.mkdir(parents=True, exist_ok=True)
 
     weights: dict[str, mx.array] = {}

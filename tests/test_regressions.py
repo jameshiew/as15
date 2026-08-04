@@ -6,6 +6,7 @@ listening (or spectral flatness) revealed them.
 
 from __future__ import annotations
 
+import itertools
 import json
 
 import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
@@ -243,6 +244,130 @@ def test_sde_draws_no_noise_for_the_interval_that_ends_at_zero(monkeypatch):
     _run_sampler(_ConstantDecoder(), infer_method="sde")
 
     assert len(keyless) == STEPS - 1
+
+
+# --- input validation ----------------------------------------------------
+
+
+@pytest.mark.parametrize("steps", [0, -1])
+def test_a_step_count_below_one_is_rejected(steps):
+    """It used to fall through to the fixed 8-step lookup table.
+
+    The CLI prints the step count it was handed before starting, so a request
+    for 0 steps announced 0 and then quietly ran 8.
+    """
+    from as15.mlx.sampler import get_timestep_schedule
+
+    with pytest.raises(ValueError, match="infer_steps"):
+        get_timestep_schedule(shift=1.0, infer_steps=steps)
+
+
+@pytest.mark.parametrize("shift", [0.0, -1.0, -0.5, float("nan"), float("inf")])
+def test_a_shift_the_timestep_map_cannot_express_is_rejected(shift):
+    """``shift*t / (1+(shift-1)*t)`` divides 0 by 0 at t=1 when shift is 0.
+
+    Negative shifts either hit that same zero denominator part-way down the
+    schedule (-1 at t=0.5) or produce a non-monotonic one.
+    """
+    from as15.mlx.sampler import get_timestep_schedule
+
+    with pytest.raises(ValueError, match="shift"):
+        get_timestep_schedule(shift=shift, infer_steps=8)
+
+
+@pytest.mark.parametrize("shift", [1.0, 2.0, 3.0, 0.5])
+def test_an_accepted_shift_gives_a_descending_schedule_inside_the_unit_interval(shift):
+    """The property the bound above protects."""
+    from as15.mlx.sampler import get_timestep_schedule
+
+    schedule = get_timestep_schedule(shift=shift, infer_steps=16)
+    assert schedule[0] == 1.0
+    assert all(0.0 < t <= 1.0 for t in schedule)
+    assert all(b < a for a, b in itertools.pairwise(schedule))
+
+
+def test_an_unknown_infer_method_is_rejected():
+    """It used to fall through to the Euler ODE branch, silently."""
+    with pytest.raises(ValueError, match="infer_method"):
+        _run_sampler(_ConstantDecoder(), infer_method="dpm")
+
+
+def test_heun_under_sde_reports_the_sampler_that_ran():
+    """Heun's corrector is an ODE construction, so SDE steps run Euler.
+
+    The loop warned about the fallback and then reported ``heun`` back to the
+    caller anyway, which is what ends up in the timings.
+    """
+    decoder = _ConstantDecoder()
+    result = _run_sampler(decoder, sampler_mode="heun", infer_method="sde")
+
+    assert result["time_costs"]["sampler_mode"] == "euler"
+    assert len(decoder.timesteps) == STEPS  # one evaluation per step, not two
+
+    ode = _run_sampler(_ConstantDecoder(), sampler_mode="heun")
+    assert ode["time_costs"]["sampler_mode"] == "heun"
+
+
+def test_an_unknown_precision_is_a_value_error_not_a_key_error():
+    """``as15 download --precision typo`` used to traceback out of the converter."""
+    with pytest.raises(ValueError, match="Unknown precision"):
+        convert.resolve_precision("typo")
+    assert convert.resolve_precision("bf16") == "bfloat16"
+    assert convert.resolve_precision("fp32") == "float32"
+
+
+CLI_REJECTS = [
+    ["--steps", "0"],
+    ["--steps", "-4"],
+    ["--shift", "0"],
+    ["--shift=-2"],
+    ["--shift", "nan"],
+    ["--shift", "inf"],
+    ["--precision", "typo"],
+    ["--sampler", "dpm"],
+]
+
+
+@pytest.mark.parametrize("argv", CLI_REJECTS, ids=lambda a: " ".join(a))
+def test_the_cli_rejects_unusable_sampling_options(argv):
+    """Every one of these has to fail before generate() fetches ~10 GB."""
+    from typer.testing import CliRunner
+
+    from as15.cli import app
+
+    result = CliRunner().invoke(app, ["sing", "--prompt", "test", *argv])
+    assert result.exit_code != 0
+
+
+def test_the_cli_accepts_the_smallest_valid_step_count(monkeypatch, tmp_path):
+    """The bound on --steps must reject 0 without rejecting 1.
+
+    Also a positive control for the cases above: a --steps that no longer
+    parses at all would fail those for the wrong reason.
+    """
+    from typer.testing import CliRunner
+
+    from as15 import cli, pipeline
+
+    seen: dict = {}
+
+    def fake_generate(spec, request, device="auto", progress=True):
+        seen["request"] = request
+        return pipeline.GenerationResult(
+            audio=np.zeros((4, 2), dtype=np.float32), sample_rate=48_000, seed=0
+        )
+
+    monkeypatch.setattr(cli, "generate", fake_generate)
+    monkeypatch.setattr(cli, "write_audio", lambda *args: None)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["sing", "-p", "x", "--steps", "1", "--shift", "2", "-o", str(tmp_path / "a")],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["request"].steps == 1
+    assert seen["request"].shift == 2.0
 
 
 # --- compute dtype -------------------------------------------------------

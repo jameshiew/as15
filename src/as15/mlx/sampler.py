@@ -40,6 +40,7 @@ class DiffusionResult(TypedDict):
 
 
 VALID_SAMPLER_MODES = {"euler", "heun"}
+VALID_INFER_METHODS = {"ode", "sde"}
 
 # Momentum coefficient of the APG running average, from the default of
 # upstream's ``MomentumBuffer`` (apg_guidance.py). Negative: each step
@@ -98,6 +99,48 @@ SHIFT_TIMESTEPS = {
 }
 
 
+def check_schedule_options(shift: float, infer_steps: int | None = None) -> None:
+    """Reject step counts and shifts the schedule cannot express.
+
+    Both used to be accepted and then quietly mean something else. A step count
+    below 1 fell through to the fixed 8-step table, so the CLI reported the
+    number it was asked for while the loop ran eight steps; and shift=0 divided
+    0 by 0 at t=1 (the map's denominator is ``1+(shift-1)*t``), while a negative
+    shift either hit that same zero denominator part-way down the schedule or
+    produced a non-monotonic one. Nothing downstream can tell those apart from a
+    deliberate setting.
+    """
+    if infer_steps is not None and infer_steps < 1:
+        raise ValueError(f"infer_steps must be at least 1, got {infer_steps}.")
+    if not math.isfinite(shift) or shift <= 0:
+        raise ValueError(f"shift must be finite and greater than zero, got {shift}.")
+
+
+def check_sampling_options(
+    sampler_mode: str,
+    infer_method: str,
+    shift: float,
+    infer_steps: int | None = None,
+) -> None:
+    """Reject an unusable sampler configuration.
+
+    Called by :func:`mlx_generate_diffusion`, and separately by the pipeline
+    before it fetches snapshots and runs conditioning -- otherwise a typo in a
+    request surfaces minutes later, on entry to the diffusion loop.
+    """
+    if sampler_mode not in VALID_SAMPLER_MODES:
+        raise ValueError(
+            f"Unsupported sampler_mode '{sampler_mode}'. Expected one of {sorted(VALID_SAMPLER_MODES)}."
+        )
+    # An unrecognised method used to fall through to the ODE branch, so a typo
+    # ran a different sampler than the caller asked for and nothing said so.
+    if infer_method not in VALID_INFER_METHODS:
+        raise ValueError(
+            f"Unsupported infer_method '{infer_method}'. Expected one of {sorted(VALID_INFER_METHODS)}."
+        )
+    check_schedule_options(shift, infer_steps)
+
+
 def get_timestep_schedule(
     shift: float = 3.0,
     timesteps: list | None = None,
@@ -118,7 +161,13 @@ def get_timestep_schedule(
 
     Returns:
         List of timestep values (descending, without trailing 0).
+
+    Raises:
+        ValueError: If ``infer_steps`` is below 1, or ``shift`` is not a finite
+            positive number.
     """
+    check_schedule_options(shift, infer_steps)
+
     t_schedule_list = None
 
     if timesteps is not None:
@@ -138,7 +187,7 @@ def get_timestep_schedule(
             ]
             t_schedule_list = mapped
 
-    if t_schedule_list is None and infer_steps is not None and infer_steps > 0:
+    if t_schedule_list is None and infer_steps is not None:
         raw = [1.0 - i / infer_steps for i in range(infer_steps)]
         if shift != 1.0:
             raw = [shift * t / (1.0 + (shift - 1.0) * t) for t in raw]
@@ -309,30 +358,38 @@ def mlx_generate_diffusion(
 
     Returns:
         Dict with ``"target_latents"`` (numpy) and ``"time_costs"`` dict.
+        ``time_costs["sampler_mode"]`` names the sampler that ran, which is
+        ``"euler"`` when a Heun request degraded under SDE.
+
+    Raises:
+        ValueError: If ``sampler_mode``, ``infer_method``, ``infer_steps`` or
+            ``shift`` is outside what this loop supports.
     """
     import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 
     from .dit import MLXCrossAttentionCache
 
-    if sampler_mode not in VALID_SAMPLER_MODES:
-        raise ValueError(
-            f"Unsupported sampler_mode '{sampler_mode}'. Expected one of {VALID_SAMPLER_MODES}."
-        )
+    check_sampling_options(sampler_mode, infer_method, shift, infer_steps)
 
-    use_heun = sampler_mode == "heun"
+    # Heun's corrector is an ODE construction; under SDE every step is Euler.
+    # Track the sampler that will actually run, so the warning below and the
+    # ``sampler_mode`` reported in ``time_costs`` agree with each other.
+    effective_sampler_mode = sampler_mode
+    if sampler_mode == "heun" and infer_method == "sde":
+        logger.warning(
+            "[MLX-DiT] Heun sampler is not supported with SDE inference method. "
+            "Falling back to Euler. Use infer_method='ode' for Heun."
+        )
+        effective_sampler_mode = "euler"
+
+    use_heun = effective_sampler_mode == "heun"
     use_norm_clamp = velocity_norm_threshold > 0
     use_ema = velocity_ema_factor > 0
 
     if use_heun:
-        if infer_method == "sde":
-            logger.warning(
-                "[MLX-DiT] Heun sampler is not supported with SDE inference method. "
-                "Falling back to Euler for SDE steps. Use infer_method='ode' for Heun."
-            )
-        else:
-            logger.info(
-                "[MLX-DiT] Using Heun (second-order) sampler for higher-quality output."
-            )
+        logger.info(
+            "[MLX-DiT] Using Heun (second-order) sampler for higher-quality output."
+        )
     if use_norm_clamp:
         logger.info(
             "[MLX-DiT] Velocity norm clamping enabled (threshold=%.2f).",
@@ -590,7 +647,7 @@ def mlx_generate_diffusion(
         # compute dtype, and the SDE branch below casts with it.
         delta = current_t - next_t
 
-        if use_heun and infer_method == "ode":
+        if use_heun:
             # ---- Heun (second-order) ODE step ----
             # Predictor: Euler step to get xt_predicted at next_t
             delta_arr = mx.full((bsz, 1, 1), delta, dtype=dt)
@@ -673,7 +730,7 @@ def mlx_generate_diffusion(
         "diffusion_time_cost"
     ] / max(num_steps, 1)
     time_costs["total_time_cost"] = total_end - total_start
-    time_costs["sampler_mode"] = sampler_mode
+    time_costs["sampler_mode"] = effective_sampler_mode
 
     # numpy has no bfloat16, and MLX refuses the buffer protocol for it, so the
     # loop's dtype has to be widened here rather than at the call site.

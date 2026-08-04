@@ -11,7 +11,7 @@ from pathlib import Path
 import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 import numpy as np
 
-from .convert import NULL_COND_KEY, convert_dit, convert_vae
+from .convert import NULL_COND_KEY, convert_dit, convert_vae, resolve_precision
 from .models import (
     BASE_REPO,
     BASE_REVISION,
@@ -153,13 +153,17 @@ def generate(
     progress: bool = True,
 ) -> GenerationResult:
     from .conditioning import Conditioner
-    from .mlx.sampler import mlx_generate_diffusion
+    from .mlx.sampler import check_sampling_options, mlx_generate_diffusion
 
     timings: dict[str, float | str] = {}
     steps = request.steps if request.steps is not None else spec.steps
     guidance = request.guidance if request.guidance is not None else spec.guidance
     shift = request.shift if request.shift is not None else spec.shift
     dcw = request.dcw if request.dcw is not None else spec.dcw
+    # Reject a malformed request here rather than after the snapshots have been
+    # fetched and the conditioner has run, which is minutes in.
+    check_sampling_options(request.sampler, request.infer_method, shift, steps)
+    compute_dtype = resolve_precision(request.precision)
     if not spec.supports_cfg and guidance > 1.0:
         # Distilled checkpoints are trained to run without a null branch;
         # forcing CFG on them doubles cost and degrades output.
@@ -195,7 +199,6 @@ def generate(
     dit = _load_dit(dit_snapshot, request.precision)
     timings["load_dit"] = time.time() - t0
 
-    compute_dtype = "bfloat16" if request.precision == "bf16" else "float32"
     result = mlx_generate_diffusion(
         mlx_decoder=dit,
         encoder_hidden_states_np=cond.encoder_hidden_states,

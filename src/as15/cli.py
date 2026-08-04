@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 import sys
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Annotated
 
 import typer
 
+from .convert import PRECISIONS
 from .models import DEFAULT_MODEL, MODELS, resolve
 from .pipeline import GenerationRequest, generate, write_audio
 
@@ -64,7 +66,7 @@ def sing(
         float, typer.Option("--duration", "-d", min=10, max=600, help="Seconds.")
     ] = 120.0,
     steps: Annotated[
-        int | None, typer.Option("--steps", "-s", help="Diffusion steps.")
+        int | None, typer.Option("--steps", "-s", min=1, help="Diffusion steps.")
     ] = None,
     guidance: Annotated[
         float | None,
@@ -99,7 +101,7 @@ def sing(
         ),
     ] = None,
     precision: Annotated[
-        str, typer.Option("--precision", help="bf16 or fp32.")
+        str, typer.Option("--precision", help=f"One of: {', '.join(PRECISIONS)}.")
     ] = "bf16",
     device: Annotated[
         str, typer.Option("--device", help="Torch device for conditioning.")
@@ -113,8 +115,12 @@ def sing(
 
     if sampler not in {"euler", "heun"}:
         raise typer.BadParameter("--sampler must be 'euler' or 'heun'")
-    if precision not in {"bf16", "fp32"}:
-        raise typer.BadParameter("--precision must be 'bf16' or 'fp32'")
+    if precision not in PRECISIONS:
+        raise typer.BadParameter(f"--precision must be one of: {', '.join(PRECISIONS)}")
+    # min= would only cover the lower bound: click parses 'inf' and 'nan' as
+    # floats, and the timestep map divides by 1+(shift-1)*t.
+    if shift is not None and (not math.isfinite(shift) or shift <= 0):
+        raise typer.BadParameter("--shift must be finite and greater than zero")
 
     lyrics_text = _read_lyrics(lyrics, lyrics_file)
     if not lyrics_text.strip():
@@ -195,11 +201,16 @@ def download(
     model: Annotated[
         str, typer.Option("--model", "-m", help=f"One of: {', '.join(MODELS)}.")
     ] = DEFAULT_MODEL,
-    precision: Annotated[str, typer.Option("--precision")] = "bf16",
+    precision: Annotated[
+        str, typer.Option("--precision", help=f"One of: {', '.join(PRECISIONS)}.")
+    ] = "bf16",
 ) -> None:
     """Fetch a checkpoint and pre-build its MLX weight cache."""
     from .convert import convert_dit, convert_vae
     from .pipeline import _resolve_snapshots
+
+    if precision not in PRECISIONS:
+        raise typer.BadParameter(f"--precision must be one of: {', '.join(PRECISIONS)}")
 
     spec = resolve(model)
     dit_snapshot, base_snapshot = _resolve_snapshots(spec)
