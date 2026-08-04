@@ -6,11 +6,10 @@ allowed-tools: Read, Write, Bash
 
 # Songwriting for as15
 
-`as15` has no planner. Upstream ACE-Step ships a 5Hz LM that invents a caption
-and lyrics from a one-line idea and guesses tempo and key; this repo deliberately
-does not load it (README, "Why not just use the upstream repo"). **You are the
-planner.** Anything you leave unset is not inferred -- it is written into the
-conditioning as the literal string `N/A`.
+`as15` generates exactly what you hand it. Nothing writes a style prompt for you,
+nothing invents lyrics, and nothing guesses a tempo or a key -- **you are the
+planner.** A meta you leave unset is not inferred: it reaches the conditioning as
+the literal string `N/A` and the model improvises around it.
 
 So the job is to produce four things, then run one command:
 
@@ -57,8 +56,8 @@ detail onto one.
 - **The prompt has a hard 256-token budget**, and roughly 54 of those are spent
   on the instruction and metas lines wrapped around it -- so about 200 tokens,
   call it 150 words, for your text. Over budget is **rejected**, not truncated:
-  the run stops with a message saying how many tokens and characters to cut.
-  Upstream truncates silently and hands back a song missing its ending.
+  the run stops before generating and tells you how many tokens and roughly how
+  many characters to cut.
 - A tight prompt of 15--40 words is usually the sweet spot. More detail is more
   control and less room for the model to be interesting; less is the reverse.
 
@@ -86,8 +85,8 @@ words, far more than a song needs -- and over budget is rejected the same way.
 
 ### Structure tags
 
-The README uses lowercase (`[verse]`, `[chorus]`); upstream examples use title
-case. Either reads fine -- pick one and stay consistent inside a sheet.
+The README writes them lowercase (`[verse]`, `[chorus]`). Stay consistent within
+a sheet.
 
 | Group | Tags |
 | --- | --- |
@@ -149,9 +148,10 @@ feel, say so.
 | `--time-signature` | **`2`, `3`, `4` or `6`** | A bare integer -- `3` for a waltz, **not** `"3/4"`. Anything else is rejected |
 | `--language` | code, default `en` | Written into the `# Languages` header; must match the lyrics |
 
-`--time-signature` is the one that catches people: upstream's field takes `4/4`
-strings, this one takes the numerator only, and the valid set is fixed at
-`(2, 3, 4, 6)` -- the signatures the metas block was trained with.
+`--time-signature` is the one that catches people: it takes the numerator on its
+own rather than a `4/4`-style string, and the valid set is fixed at
+`(2, 3, 4, 6)` -- the signatures the metas block was trained with. Anything else
+is rejected before the run starts.
 
 Set `--bpm` when you need to match other material, when the genre is tempo-defined
 (house ~124, boom bap ~90, drum and bass ~174), or when the lyric density needs a
@@ -202,7 +202,8 @@ uv run as15 models
 | Guidance | 7.0 | none (distilled; `-g` ignored) |
 | Shift | 1.0 | 3.0 |
 | DCW | off | on |
-| Speed | reference quality | ~6x faster |
+| Relative speed | 1x | ~6x |
+| Use for | the take you keep | drafting and iteration |
 
 Scaling the README's M5 timings, a 120 s take is roughly **10 minutes** of
 diffusion on `xl-sft` and roughly **40 seconds** on `xl-turbo`. That ratio is the
@@ -251,12 +252,24 @@ whole workflow: iterate on turbo, render on sft.
 Output must be `.flac`; the path is checked before the run, not after 10 minutes
 of diffusion. An existing file is overwritten and you are warned first.
 
-Every take carries its own recipe in Vorbis comments -- `DESCRIPTION`, `LYRICS`,
+Every take carries its own recipe in Vorbis comments -- the prompt, the lyrics,
 `AS15_SEED`, `AS15_MODEL`, `AS15_CHECKPOINT`, steps, guidance, shift, sampler,
-DCW, and any metas that were set (`describe()` in `src/as15/pipeline.py`). None of
-it is a clock or a machine ID, so the same command twice gives a byte-identical
-file, and `metaflac --list --block-type=VORBIS_COMMENT out/final.flac` tells you
-how any take was made.
+DCW, and any metas that were set (`describe()` in `src/as15/pipeline.py`). None
+of it is a clock or a machine ID, so the same command twice gives a
+byte-identical file. Read a take back with:
+
+```bash
+ffprobe -v error -show_entries format_tags -of default out/final.flac
+```
+
+The style prompt comes back as `comment`: ffmpeg maps the Vorbis `DESCRIPTION`
+field onto its own key, so asking for `format_tags=DESCRIPTION` returns nothing.
+Every `AS15_*` field keeps its name, so a single value pulls out cleanly -- which
+is how you recover the seed of a take worth re-rendering:
+
+```bash
+ffprobe -v error -show_entries format_tags=AS15_SEED -of csv=p=0 out/final.flac
+```
 
 Pre-fetch weights before a first run so the download is not mistaken for a hang:
 
