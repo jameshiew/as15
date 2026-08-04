@@ -1,4 +1,4 @@
-"""The Oobleck VAE: windowed decode, and the weights it is handed.
+"""The Oobleck VAE decoder: windowed decode, and the weights it is handed.
 
 Two claims are checked here that nothing else can check. The first is that
 decoding in windows returns what decoding the whole track returns -- the
@@ -17,7 +17,7 @@ import pytest
 
 import reference
 from as15 import convert, models, pipeline
-from as15.mlx.vae import MLXAutoEncoderOobleck
+from as15.mlx.vae import MLXOobleckVAE
 from helpers import flat_parameters, randomised
 
 # --- the reference, checked against the framework it describes -------------
@@ -73,9 +73,8 @@ TINY_RATIOS = [2, 4]
 TINY_LATENT_CHANNELS = 6
 
 
-def _tiny_vae() -> MLXAutoEncoderOobleck:
-    return MLXAutoEncoderOobleck(
-        encoder_hidden_size=4,
+def _tiny_vae() -> MLXOobleckVAE:
+    return MLXOobleckVAE(
         downsampling_ratios=TINY_RATIOS,
         channel_multiples=[2, 3],
         decoder_channels=2,
@@ -85,7 +84,7 @@ def _tiny_vae() -> MLXAutoEncoderOobleck:
 
 
 def _published_weights(
-    vae: MLXAutoEncoderOobleck,
+    vae: MLXOobleckVAE,
 ) -> tuple[dict[str, mx.array], dict[str, np.ndarray]]:
     """Invent a checkpoint in the layout the VAE is published in.
 
@@ -140,11 +139,23 @@ def test_the_converter_emits_exactly_the_parameters_the_model_loads():
     """``load_weights`` is strict, and that is the whole of the structural check.
 
     A key the converter renames, drops or invents is caught here rather than
-    at the end of a 337 MB conversion -- and a permutation that changes a
+    at the end of a 338 MB conversion -- and a permutation that changes a
     shape is caught with it.
+
+    The published checkpoint is an autoencoder and this port is the decode
+    half of one, so half of what is handed to the converter has no parameter
+    to land on. Dropping it is not an optimisation the strictness would
+    tolerate quietly: an encoder tensor that reached the cache would fail
+    every load from it.
     """
     vae = _tiny_vae()
     checkpoint, _ = _published_weights(vae)
+    # The half of the file nothing decodes with, in the same layout as the
+    # rest -- weight_norm pair included, so a converter that dropped the
+    # subtree only by failing to find its partner would still be caught.
+    checkpoint["encoder.conv1.weight_v"] = mx.zeros((4, 2, 7))
+    checkpoint["encoder.conv1.weight_g"] = mx.ones((4, 1, 1))
+    checkpoint["encoder.snake1.alpha"] = mx.zeros((1, 4, 1))
 
     converted = convert._convert_vae_weights(checkpoint)
 
@@ -199,9 +210,8 @@ CHUNK = 64
 
 
 @pytest.fixture(scope="module")
-def decoder() -> MLXAutoEncoderOobleck:
-    vae = MLXAutoEncoderOobleck(
-        encoder_hidden_size=8,
+def decoder() -> MLXOobleckVAE:
+    vae = MLXOobleckVAE(
         downsampling_ratios=PUBLISHED_RATIOS,
         channel_multiples=[1, 2, 2, 2, 2],
         decoder_channels=4,

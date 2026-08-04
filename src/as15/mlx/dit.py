@@ -64,10 +64,6 @@ class MLXRotaryEmbedding(nn.Module):
 
     def __init__(self, head_dim: int, max_len: int = 32768, base: float = 1_000_000.0):
         super().__init__()
-        self.head_dim = head_dim
-        self.max_len = max_len
-        self.base = base
-
         inv_freq = 1.0 / (
             base ** (mx.arange(0, head_dim, 2).astype(mx.float32) / head_dim)
         )
@@ -97,14 +93,6 @@ class MLXRotaryEmbedding(nn.Module):
             mx.eval(cos, sin)
             self._slices[key] = (cos, sin)
         return self._slices[key]
-
-    def materialize_static_buffers(self) -> None:
-        """Materialize cached RoPE tables on the current MLX stream.
-
-        The tables are not MLX module parameters, so parameter-only evaluation
-        does not force them before Gradio worker threads reuse the decoder.
-        """
-        mx.eval(self._cos, self._sin)
 
 
 # ---------------------------------------------------------------------------
@@ -171,17 +159,14 @@ class MLXAttention(nn.Module):
         attention_bias: bool,
         layer_idx: int,
         is_cross_attention: bool = False,
-        sliding_window: int | None = None,
     ):
         super().__init__()
-        self.hidden_size = hidden_size
         self.num_heads = num_attention_heads
         self.num_kv_heads = num_key_value_heads
         self.head_dim = head_dim
         self.scale = head_dim**-0.5
         self.layer_idx = layer_idx
         self.is_cross_attention = is_cross_attention
-        self.sliding_window = sliding_window
 
         self.q_proj = nn.Linear(
             hidden_size, num_attention_heads * head_dim, bias=attention_bias
@@ -286,11 +271,13 @@ class MLXDiTLayer(nn.Module):
         attention_bias: bool,
         layer_idx: int,
         layer_type: str,
-        sliding_window: int | None = None,
     ):
         super().__init__()
+        # Which of the two masks the decoder hands this layer's self-attention.
+        # The window size itself lives on the decoder, which is what builds and
+        # memoises the mask: one mask serves every sliding layer, so an
+        # attention that carried its own copy of the width never read it.
         self.layer_type = layer_type
-        sw = sliding_window if layer_type == "sliding_attention" else None
 
         # 1. Self-attention
         self.self_attn_norm = nn.RMSNorm(hidden_size, eps=rms_norm_eps)
@@ -303,7 +290,6 @@ class MLXDiTLayer(nn.Module):
             attention_bias=attention_bias,
             layer_idx=layer_idx,
             is_cross_attention=False,
-            sliding_window=sw,
         )
 
         # 2. Cross-attention
@@ -523,7 +509,6 @@ class MLXDiTDecoder(nn.Module):
                 attention_bias=attention_bias,
                 layer_idx=i,
                 layer_type=layer_types[i],
-                sliding_window=sliding_window,
             )
             for i in range(num_hidden_layers)
         ]
@@ -545,10 +530,6 @@ class MLXDiTDecoder(nn.Module):
         self._sliding_masks: dict[tuple[int, str], mx.array] = {}
         self._sliding_window = sliding_window
         self._layer_types = layer_types
-
-    def materialize_static_buffers(self) -> None:
-        """Materialize non-parameter MLX buffers before cross-thread use."""
-        self.rotary_emb.materialize_static_buffers()
 
     def _get_sliding_mask(self, seq_len: int, dtype: mx.Dtype) -> mx.array:
         """Return a materialized sliding-window mask for the requested sequence length."""

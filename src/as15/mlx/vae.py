@@ -1,20 +1,24 @@
-# Pure MLX re-implementation of diffusers' AutoencoderOobleck for Apple Silicon.
+# Pure MLX port of the decode half of diffusers' AutoencoderOobleck.
 #
 # Architecture mirrors the PyTorch version exactly:
-#   Snake1d -> OobleckResidualUnit -> EncoderBlock / DecoderBlock
-#   -> OobleckEncoder / OobleckDecoder -> MLXAutoEncoderOobleck
+#   Snake1d -> OobleckResidualUnit -> DecoderBlock -> OobleckDecoder
+#   -> MLXOobleckVAE
+#
+# The encoder half is deliberately absent. Generation goes latents -> audio and
+# never the other way: nothing in this package encodes, there is no reference
+# implementation to check an encoder against (`tests/reference.py` implements
+# the published decoder only), and building one meant constructing ~half the
+# VAE's parameters and converting ~half its checkpoint on every run to hold
+# weights no forward pass would read. Restoring it means restoring the
+# `encoder.*` branch of `convert._convert_vae_weights` with it.
 #
 # All operations use MLX channels-last (NLC) convention internally.
-# The public encode/decode API accepts and returns NLC arrays.
+# The public decode API accepts and returns NLC arrays.
 
-import logging
 import math
 
 import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 import mlx.nn as nn
-
-logger = logging.getLogger(__name__)
-
 
 # ---------------------------------------------------------------------------
 # Snake1d Activation
@@ -37,18 +41,13 @@ class MLXSnake1d(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         # x: [B, L, C]  (NLC)
-        # NOTE: Upcast to float32 for exp/sin/power to prevent overflow with float16
-        # weights (exp overflows float16 at alpha > ~11).  This is only a problem
-        # if the weights are in float16.  The surrounding
-        # Conv1d layers still run in the caller's dtype (float16) for speed.
-
-        # This is the original code that works with float16 weights, if we end up needing to
-        # use float16 weights. please use this code instead
-        # alpha = mx.exp(self.alpha.astype(mx.float32)) if self.logscale else self.alpha
-        # beta = mx.exp(self.beta.astype(mx.float32)) if self.logscale else self.beta
-        # x_f32 = x.astype(mx.float32)
-        # result = x_f32 + mx.reciprocal(beta + 1e-9) * mx.power(mx.sin(alpha * x_f32), 2)
-        # return result.astype(x.dtype)
+        #
+        # ``exp`` is taken in whatever dtype the parameters arrived in, which
+        # for this model is always float32: ``convert_vae`` casts the whole VAE
+        # to fp32 and the decode is the one stage that does not run at the
+        # request's precision. At float16 it would not be -- exp overflows
+        # there at alpha > ~11 -- so a half-precision VAE would need this and
+        # the two multiplies below widened, not just the weights re-cast.
         alpha = mx.exp(self.alpha) if self.logscale else self.alpha
         beta = mx.exp(self.beta) if self.logscale else self.beta
         # All ops broadcast [C] over [B, L, C]
@@ -89,33 +88,8 @@ class MLXOobleckResidualUnit(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Encoder / Decoder Blocks
+# Decoder Block
 # ---------------------------------------------------------------------------
-
-
-class MLXOobleckEncoderBlock(nn.Module):
-    """3 residual units (dilations 1, 3, 9) -> Snake -> strided Conv1d down."""
-
-    def __init__(self, input_dim: int, output_dim: int, stride: int = 1):
-        super().__init__()
-        self.res_unit1 = MLXOobleckResidualUnit(input_dim, dilation=1)
-        self.res_unit2 = MLXOobleckResidualUnit(input_dim, dilation=3)
-        self.res_unit3 = MLXOobleckResidualUnit(input_dim, dilation=9)
-        self.snake1 = MLXSnake1d(input_dim)
-        self.conv1 = nn.Conv1d(
-            input_dim,
-            output_dim,
-            kernel_size=2 * stride,
-            stride=stride,
-            padding=math.ceil(stride / 2),
-        )
-
-    def __call__(self, hidden_state: mx.array) -> mx.array:
-        hidden_state = self.res_unit1(hidden_state)
-        hidden_state = self.res_unit2(hidden_state)
-        hidden_state = self.snake1(self.res_unit3(hidden_state))
-        hidden_state = self.conv1(hidden_state)
-        return hidden_state
 
 
 class MLXOobleckDecoderBlock(nn.Module):
@@ -145,49 +119,8 @@ class MLXOobleckDecoderBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Encoder / Decoder
+# Decoder
 # ---------------------------------------------------------------------------
-
-
-class MLXOobleckEncoder(nn.Module):
-    """Oobleck Encoder: Conv1d -> N encoder blocks -> Snake -> Conv1d."""
-
-    def __init__(
-        self,
-        encoder_hidden_size: int,
-        audio_channels: int,
-        downsampling_ratios: list[int],
-        channel_multiples: list[int],
-    ):
-        super().__init__()
-        strides = downsampling_ratios
-        cm = [1, *channel_multiples]
-
-        self.conv1 = nn.Conv1d(
-            audio_channels, encoder_hidden_size, kernel_size=7, padding=3
-        )
-
-        self.block = []
-        for i, stride in enumerate(strides):
-            self.block.append(
-                MLXOobleckEncoderBlock(
-                    input_dim=encoder_hidden_size * cm[i],
-                    output_dim=encoder_hidden_size * cm[i + 1],
-                    stride=stride,
-                )
-            )
-
-        d_model = encoder_hidden_size * cm[-1]
-        self.snake1 = MLXSnake1d(d_model)
-        self.conv2 = nn.Conv1d(d_model, encoder_hidden_size, kernel_size=3, padding=1)
-
-    def __call__(self, hidden_state: mx.array) -> mx.array:
-        hidden_state = self.conv1(hidden_state)
-        for module in self.block:
-            hidden_state = module(hidden_state)
-        hidden_state = self.snake1(hidden_state)
-        hidden_state = self.conv2(hidden_state)
-        return hidden_state
 
 
 class MLXOobleckDecoder(nn.Module):
@@ -234,12 +167,17 @@ class MLXOobleckDecoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Full VAE
+# The VAE, as far as generation uses it
 # ---------------------------------------------------------------------------
 
 
-class MLXAutoEncoderOobleck(nn.Module):
-    """Pure-MLX re-implementation of ``diffusers.AutoencoderOobleck``.
+class MLXOobleckVAE(nn.Module):
+    """The decode half of ``diffusers.AutoencoderOobleck``, in pure MLX.
+
+    A module rather than the bare :class:`MLXOobleckDecoder` because the
+    checkpoint publishes the decoder one level down, under ``decoder.*``: the
+    nesting is what lets the converted cache keep the published names instead
+    of renaming every key on the way in.
 
     Every geometry parameter is required, deliberately. ACE-Step 1.5 is not
     configured like the Stable Audio VAE it descends from -- it downsamples by
@@ -255,7 +193,6 @@ class MLXAutoEncoderOobleck(nn.Module):
 
     def __init__(
         self,
-        encoder_hidden_size: int,
         downsampling_ratios: list[int],
         channel_multiples: list[int],
         decoder_channels: int,
@@ -263,15 +200,8 @@ class MLXAutoEncoderOobleck(nn.Module):
         audio_channels: int,
     ):
         super().__init__()
-        self.encoder_hidden_size = encoder_hidden_size
-        self.decoder_input_channels = decoder_input_channels
-
-        self.encoder = MLXOobleckEncoder(
-            encoder_hidden_size=encoder_hidden_size,
-            audio_channels=audio_channels,
-            downsampling_ratios=downsampling_ratios,
-            channel_multiples=channel_multiples,
-        )
+        # Named for the config field, which describes the encoder: the decoder
+        # walks the same ratios back up, so this is the one place they reverse.
         self.decoder = MLXOobleckDecoder(
             channels=decoder_channels,
             input_channels=decoder_input_channels,
@@ -279,35 +209,6 @@ class MLXAutoEncoderOobleck(nn.Module):
             upsampling_ratios=downsampling_ratios[::-1],
             channel_multiples=channel_multiples,
         )
-
-    # -- public API ---------------------------------------------------------
-
-    def encode_and_sample(self, audio_nlc: mx.array) -> mx.array:
-        """Encode audio -> sample latent.
-
-        Args:
-            audio_nlc: [B, L_audio, C_audio] in NLC format.
-
-        Returns:
-            z: [B, L_latent, C_latent] sampled latent.
-        """
-        h = self.encoder(audio_nlc)  # [B, L', encoder_hidden_size]
-
-        # Diagonal Gaussian: split into mean + log-scale
-        mean, scale = mx.split(h, 2, axis=-1)
-
-        # softplus(scale) + epsilon  (numerically stable)
-        std = mx.where(scale > 20.0, scale, mx.log(1.0 + mx.exp(scale))) + 1e-4
-
-        noise = mx.random.normal(mean.shape)
-        z = mean + std * noise
-        return z
-
-    def encode_mean(self, audio_nlc: mx.array) -> mx.array:
-        """Encode audio -> return mean (no sampling noise)."""
-        h = self.encoder(audio_nlc)
-        mean, _scale = mx.split(h, 2, axis=-1)
-        return mean
 
     def decode(self, latents_nlc: mx.array) -> mx.array:
         """Decode latents -> audio.
@@ -319,18 +220,3 @@ class MLXAutoEncoderOobleck(nn.Module):
             audio: [B, L_audio, C_audio] in NLC format.
         """
         return self.decoder(latents_nlc)
-
-    # -- construction helpers -----------------------------------------------
-
-    @classmethod
-    def from_pytorch_config(cls, pt_vae) -> MLXAutoEncoderOobleck:
-        """Construct from a PyTorch ``AutoencoderOobleck`` instance's config."""
-        cfg = pt_vae.config
-        return cls(
-            encoder_hidden_size=cfg.encoder_hidden_size,
-            downsampling_ratios=list(cfg.downsampling_ratios),
-            channel_multiples=list(cfg.channel_multiples),
-            decoder_channels=cfg.decoder_channels,
-            decoder_input_channels=cfg.decoder_input_channels,
-            audio_channels=cfg.audio_channels,
-        )

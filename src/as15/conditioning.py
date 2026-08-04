@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .models import LATENT_FPS, shard_files
+from .models import latent_frames_for, shard_files
 
 # The CFG null branch's condition embedding, stored at the top level of the DiT
 # checkpoint. Read here and nowhere else: the converter used to copy it into
@@ -154,13 +154,11 @@ class Conditioner:
         self.dit_snapshot = dit_snapshot
 
         config_json = json.loads((dit_snapshot / "config.json").read_text())
-        self.config_json = config_json
         remote_module = config_json["auto_map"]["AutoModel"].split(".")[0]
 
         from transformers import AutoConfig
 
         config = AutoConfig.from_pretrained(dit_snapshot, trust_remote_code=True)
-        self.config = config
 
         # XL checkpoints size the encoder independently of the decoder.
         encoder_config = copy.deepcopy(config)
@@ -272,7 +270,7 @@ class Conditioner:
             refer_audio_order_mask=refer_order_mask,
         )
 
-        frames = max(1, round(duration * LATENT_FPS))
+        frames = latent_frames_for(duration)
         src_latents = self.silence_slice(frames)
         chunk_masks = torch.full_like(src_latents, CHUNK_MASK_FULL)
         context_latents = torch.cat([src_latents, chunk_masks], dim=-1)

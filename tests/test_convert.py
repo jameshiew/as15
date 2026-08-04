@@ -296,6 +296,7 @@ CONVERTER_DIGESTS = {
     ("dit", 1): "1bacd5368711b479",
     ("dit", 2): "84c5bcb0a6657909",  # stopped copying null_condition_emb in
     ("vae", 1): "485e8044cc390bb1",
+    ("vae", 2): "d8c7def703249a82",  # stopped converting the encoder subtree
 }
 
 

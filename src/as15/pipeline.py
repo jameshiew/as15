@@ -19,7 +19,6 @@ from .models import (
     BASE_REPO,
     BASE_REVISION,
     LATENT_CHANNELS,
-    LATENT_FPS,
     SAMPLE_RATE,
     VAE_HOP,
     ModelSpec,
@@ -232,13 +231,12 @@ def _resolve_snapshots(spec: ModelSpec) -> tuple[Snapshot, Snapshot]:
 
 
 def _load_vae(base_snapshot: Snapshot):
-    from .mlx.vae import MLXAutoEncoderOobleck
+    from .mlx.vae import MLXOobleckVAE
 
     path = convert_vae(base_snapshot)
     cfg = json.loads((base_snapshot.path / "vae" / "config.json").read_text())
     check_vae_geometry(cfg)
-    vae = MLXAutoEncoderOobleck(
-        encoder_hidden_size=cfg["encoder_hidden_size"],
+    vae = MLXOobleckVAE(
         downsampling_ratios=cfg["downsampling_ratios"],
         channel_multiples=cfg["channel_multiples"],
         decoder_channels=cfg["decoder_channels"],
@@ -262,7 +260,6 @@ def _load_dit(dit_snapshot: Snapshot, precision: str):
     dit = MLXDiTDecoder.from_config(config)
     dit.load_weights(list(weights.items()))
     mx.eval(dit.parameters())
-    dit.materialize_static_buffers()
     return dit
 
 
@@ -455,7 +452,3 @@ def write_audio(path: Path, audio: np.ndarray, sample_rate: int) -> None:
         path,
         lambda tmp: sf.write(str(tmp), audio, sample_rate, subtype=OUTPUT_SUBTYPE),
     )
-
-
-def latent_frames_for(duration: float) -> int:
-    return max(1, round(duration * LATENT_FPS))

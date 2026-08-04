@@ -55,13 +55,13 @@ def resolve_precision(precision: str) -> str:
 # The version is part of the cache path, so a bump orphans the old file rather
 # than silently loading weights the current MLX models cannot interpret. The
 # two converters version independently: the DiT cache is ~8.3 GB and there is
-# no reason to rebuild it when only the 337 MB VAE conversion changes.
+# no reason to rebuild it when only the 338 MB VAE conversion changes.
 #
 # Remembering to bump it is the whole of the protection, so it is not left to
-# memory: the converters are fingerprinted in tests/test_regressions.py, which
+# memory: the converters are fingerprinted in tests/test_convert.py, which
 # fails on an unaccompanied edit to either of them.
 DIT_CONVERTER_VERSION = 2
-VAE_CONVERTER_VERSION = 1
+VAE_CONVERTER_VERSION = 2
 
 
 def _convert_dit_key(key: str) -> tuple[str, str] | None:
@@ -318,9 +318,17 @@ def vae_cache_path(repo_id: str, revision: str) -> Path:
 
 
 def _convert_vae_weights(source: Mapping[str, mx.array]) -> dict[str, mx.array]:
-    """Fuse and re-layout every VAE tensor. See :func:`_convert_dit_shard`."""
+    """Fuse and re-layout the VAE tensors MLX loads. See :func:`_convert_dit_shard`.
+
+    That is the ``decoder.*`` subtree and nothing else. Generation only ever
+    decodes, so :class:`~as15.mlx.vae.MLXOobleckVAE` builds no encoder and
+    ``load_weights`` -- strict, which is what makes this the structural check
+    -- would reject the encoder's half of the checkpoint if it were emitted.
+    """
     weights: dict[str, mx.array] = {}
     for key in tqdm(sorted(source), desc="Converting VAE", unit="tensor"):
+        if not key.startswith("decoder."):
+            continue
         if key.endswith(".weight_v"):
             continue  # consumed with its .weight_g partner
         if key.endswith(".weight_g"):
@@ -345,9 +353,12 @@ def _convert_vae_weights(source: Mapping[str, mx.array]) -> dict[str, mx.array]:
 
 
 def convert_vae(base: Snapshot, force: bool = False) -> Path:
-    """Fuse weight-norm and re-layout the Oobleck VAE for MLX.
+    """Fuse weight-norm and re-layout the Oobleck VAE decoder for MLX.
 
-    The VAE stays fp32: it is only 337 MB and runs once per generation.
+    The VAE stays fp32: the decoder is 338 MB at fp32 and runs once per
+    generation. The published file is 337 MB for *both* halves because it
+    ships bf16 -- which is where the figure this docstring used to quote came
+    from, and it was describing a 675 MB conversion at the time.
     """
     out = vae_cache_path(base.repo_id, base.revision)
     manifest: dict[str, object] = {

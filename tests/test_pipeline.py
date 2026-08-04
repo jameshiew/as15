@@ -389,15 +389,21 @@ def test_the_channel_count_is_whatever_the_decode_produced(channels, tmp_path):
     assert read.shape == (audio.shape[0], channels)
 
 
-def test_the_latent_window_matches_what_conditioning_sizes(tmp_path):
+def test_the_latent_window_matches_what_conditioning_sizes():
     """One function, so the decode length and the conditioning agree.
 
     A duration that rounded one way here and another way in the conditioner
     would decode to a track a frame short of the context it was generated
-    against.
+    against -- which is what this could not actually catch while the
+    conditioner carried its own copy of the expression and this asserted the
+    copy against itself. There is one definition now, and the identity below
+    is what says so: re-inlining the arithmetic leaves an unused import, which
+    ruff fails.
     """
+    assert conditioning.latent_frames_for is models.latent_frames_for
+
     for duration in (10.0, 30.0, 120.5, 600.0):
-        assert pipeline.latent_frames_for(duration) == max(
+        assert models.latent_frames_for(duration) == max(
             1, round(duration * models.LATENT_FPS)
         )
-    assert pipeline.latent_frames_for(0.0) == 1
+    assert models.latent_frames_for(0.0) == 1

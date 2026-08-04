@@ -27,6 +27,18 @@ LATENT_FPS = SAMPLE_RATE // VAE_HOP  # 25
 LATENT_CHANNELS = 64
 
 
+def latent_frames_for(duration: float) -> int:
+    """How many latent frames *duration* seconds of audio occupies.
+
+    Here rather than in either caller because both need it and they have to
+    agree: conditioning sizes the context block with it before the DiT loads,
+    and the decode length follows from the same count. Rounding one way in one
+    place and the other way in the other decodes a track a frame short of the
+    context it was generated against.
+    """
+    return max(1, round(duration * LATENT_FPS))
+
+
 def check_vae_geometry(cfg: Mapping[str, Any]) -> None:
     """Fail if a VAE checkpoint contradicts the constants above.
 
