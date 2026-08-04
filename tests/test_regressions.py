@@ -420,6 +420,113 @@ def test_an_unknown_precision_is_a_value_error_not_a_key_error():
     assert convert.resolve_precision("fp32") == "float32"
 
 
+def _request(**kwargs):
+    """A request that resolve_settings accepts, before *kwargs* spoils it."""
+    from as15.pipeline import GenerationRequest
+
+    return GenerationRequest(style_prompt="a song", lyrics="", **kwargs)
+
+
+@pytest.mark.parametrize("duration", [float("nan"), float("inf"), -1.0, 5.0, 1e9])
+def test_a_duration_the_pipeline_cannot_honour_is_rejected(duration):
+    """click's ``min=``/``max=`` are `<`/`>` comparisons, which NaN passes.
+
+    A NaN duration then reached ``int(duration)`` in the metas block and
+    ``round(duration * LATENT_FPS)`` in the latent window; an unbounded one
+    sized a latent tensor from whatever the caller passed.
+    """
+    from as15.pipeline import resolve_settings
+
+    with pytest.raises(ValueError, match="duration"):
+        resolve_settings(MODELS["xl-sft"], _request(duration=duration))
+
+
+@pytest.mark.parametrize("guidance", [0.5, 0.0, -10.0, float("nan"), float("inf")])
+def test_guidance_that_does_not_mean_what_it_says_is_rejected(guidance):
+    """The loop turns CFG on only above 1.0.
+
+    So 0.5 and -10 ran the same conditional-only pass as 1.0 while the banner
+    reported the number the caller asked for, and inf went into the guidance
+    arithmetic and took the latents with it.
+    """
+    from as15.pipeline import resolve_settings
+
+    with pytest.raises(ValueError, match="guidance"):
+        resolve_settings(MODELS["xl-sft"], _request(guidance=guidance))
+
+
+def test_guidance_of_exactly_one_is_how_cfg_is_turned_off():
+    """The bound above must not reject the documented way to disable CFG."""
+    from as15.pipeline import resolve_settings
+
+    assert resolve_settings(MODELS["xl-sft"], _request(guidance=1.0)).guidance == 1.0
+
+
+def test_a_distilled_checkpoint_reports_the_guidance_it_runs():
+    """xl-turbo has no null branch, so CFG is dropped rather than honoured."""
+    from as15.pipeline import resolve_settings
+
+    assert resolve_settings(MODELS["xl-turbo"], _request(guidance=7.0)).guidance == 1.0
+
+
+@pytest.mark.parametrize("seed", [-1, 2**64])
+def test_a_seed_outside_the_key_range_is_rejected(seed):
+    """``mx.random.key`` takes a uint64 and raises TypeError outside it.
+
+    That happened inside the diffusion loop, minutes in, without naming the
+    seed. The sampler's own list-of-seeds form reads a negative entry as
+    "unseeded" instead, so the two disagreed about what -1 meant.
+    """
+    from as15.pipeline import resolve_settings
+
+    with pytest.raises(ValueError, match="seed"):
+        resolve_settings(MODELS["xl-sft"], _request(seed=seed))
+
+    with pytest.raises(TypeError):
+        mx.random.key(seed)
+
+
+@pytest.mark.parametrize("bpm", [0, -120, "0", "  "])
+def test_a_bpm_that_is_not_a_tempo_is_rejected(bpm):
+    """``bpm or 'N/A'`` renders 0 as *unset*; a negative one is written out."""
+    from as15.pipeline import resolve_settings
+
+    with pytest.raises(ValueError, match="bpm"):
+        resolve_settings(MODELS["xl-sft"], _request(bpm=bpm))
+
+
+@pytest.mark.parametrize("time_signature", [5, 0, "4/4", "common"])
+def test_a_time_signature_the_metas_block_was_not_trained_on_is_rejected(
+    time_signature,
+):
+    """--time-signature has always documented 2, 3, 4 or 6; now it means it."""
+    from as15.pipeline import resolve_settings
+
+    with pytest.raises(ValueError, match="time_signature"):
+        resolve_settings(MODELS["xl-sft"], _request(time_signature=time_signature))
+
+
+@pytest.mark.parametrize("time_signature", [2, 3, 4, 6, "4"])
+def test_the_documented_time_signatures_are_accepted(time_signature):
+    from as15.pipeline import resolve_settings
+
+    resolve_settings(MODELS["xl-sft"], _request(time_signature=time_signature))
+
+
+def test_settings_come_from_the_checkpoint_when_the_request_omits_them():
+    """The CLI banner prints these, so they have to be the ones that run."""
+    from as15.pipeline import resolve_settings
+
+    for spec in MODELS.values():
+        settings = resolve_settings(spec, _request())
+        assert (settings.steps, settings.shift, settings.dcw) == (
+            spec.steps,
+            spec.shift,
+            spec.dcw,
+        )
+        assert settings.compute_dtype == "bfloat16"
+
+
 CLI_REJECTS = [
     ["--steps", "0"],
     ["--steps", "-4"],
@@ -429,17 +536,35 @@ CLI_REJECTS = [
     ["--shift", "inf"],
     ["--precision", "typo"],
     ["--sampler", "dpm"],
+    ["--duration", "nan"],
+    ["--duration", "inf"],
+    ["--guidance", "0.5"],
+    ["--guidance=-10"],
+    ["--guidance", "nan"],
+    ["--seed=-1"],
+    ["--bpm", "0"],
+    ["--time-signature", "5"],
+    ["--language", " "],
 ]
 
 
 @pytest.mark.parametrize("argv", CLI_REJECTS, ids=lambda a: " ".join(a))
-def test_the_cli_rejects_unusable_sampling_options(argv):
-    """Every one of these has to fail before generate() fetches ~10 GB."""
+def test_the_cli_rejects_unusable_options(argv, monkeypatch):
+    """Every one of these has to fail before generate() fetches ~10 GB.
+
+    generate() is stubbed to say so rather than to let a regression here spend
+    a CI run downloading a checkpoint.
+    """
     from typer.testing import CliRunner
 
-    from as15.cli import app
+    from as15 import cli
 
-    result = CliRunner().invoke(app, ["sing", "--prompt", "test", *argv])
+    def unreachable(*args, **kwargs):
+        raise AssertionError(f"generate() ran for {argv}")
+
+    monkeypatch.setattr(cli, "generate", unreachable)
+
+    result = CliRunner().invoke(cli.app, ["sing", "--prompt", "test", *argv])
     assert result.exit_code != 0
 
 

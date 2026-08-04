@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import random
 import sys
 from pathlib import Path
@@ -12,7 +11,14 @@ import typer
 
 from .convert import PRECISIONS
 from .models import DEFAULT_MODEL, MODELS, resolve
-from .pipeline import GenerationRequest, generate, write_audio
+from .pipeline import (
+    MAX_DURATION,
+    MIN_DURATION,
+    GenerationRequest,
+    generate,
+    resolve_settings,
+    write_audio,
+)
 
 app = typer.Typer(
     add_completion=False,
@@ -63,14 +69,26 @@ def sing(
         str, typer.Option("--model", "-m", help=f"One of: {', '.join(MODELS)}.")
     ] = DEFAULT_MODEL,
     duration: Annotated[
-        float, typer.Option("--duration", "-d", min=10, max=600, help="Seconds.")
+        float,
+        typer.Option(
+            "--duration",
+            "-d",
+            min=MIN_DURATION,
+            max=MAX_DURATION,
+            help="Seconds.",
+        ),
     ] = 120.0,
     steps: Annotated[
         int | None, typer.Option("--steps", "-s", min=1, help="Diffusion steps.")
     ] = None,
     guidance: Annotated[
         float | None,
-        typer.Option("--guidance", "-g", help="CFG scale (ignored by turbo)."),
+        typer.Option(
+            "--guidance",
+            "-g",
+            help="CFG scale; 1.0 turns it off, below that is rejected. "
+            "Ignored by turbo.",
+        ),
     ] = None,
     shift: Annotated[
         float | None,
@@ -112,24 +130,7 @@ def sing(
 ) -> None:
     """Generate a song from a style prompt and lyrics."""
     spec = resolve(model)
-
-    if sampler not in {"euler", "heun"}:
-        raise typer.BadParameter("--sampler must be 'euler' or 'heun'")
-    if precision not in PRECISIONS:
-        raise typer.BadParameter(f"--precision must be one of: {', '.join(PRECISIONS)}")
-    # min= would only cover the lower bound: click parses 'inf' and 'nan' as
-    # floats, and the timestep map divides by 1+(shift-1)*t.
-    if shift is not None and (not math.isfinite(shift) or shift <= 0):
-        raise typer.BadParameter("--shift must be finite and greater than zero")
-
     lyrics_text = _read_lyrics(lyrics, lyrics_file)
-    if not lyrics_text.strip():
-        typer.secho(
-            "No lyrics given - generating an instrumental. "
-            "Pass --lyrics or --lyrics-file for vocals.",
-            fg=typer.colors.YELLOW,
-            err=True,
-        )
 
     if seed is None:
         seed = random.randint(0, 2**31 - 1)
@@ -151,17 +152,29 @@ def sing(
         precision=precision,
     )
 
-    eff_steps = steps if steps is not None else spec.steps
-    eff_shift = shift if shift is not None else spec.shift
-    eff_dcw = dcw if dcw is not None else spec.dcw
-    eff_guidance = guidance if guidance is not None else spec.guidance
-    if not spec.supports_cfg:
-        eff_guidance = 1.0
+    # The same call generate() makes, so the banner below cannot report
+    # settings other than the ones that run -- and so a bad option costs a
+    # second rather than the minutes it takes to reach the diffusion loop.
+    try:
+        settings = resolve_settings(spec, request)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
+
+    if not lyrics_text.strip():
+        typer.secho(
+            "No lyrics given - generating an instrumental. "
+            "Pass --lyrics or --lyrics-file for vocals.",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+
     typer.secho(f"model     {spec.key}  ({spec.repo_id}@{spec.revision[:8]})", err=True)
-    typer.secho(f"duration  {duration:g}s   steps {eff_steps}   seed {seed}", err=True)
     typer.secho(
-        f"sampling  shift {eff_shift:g}   guidance {eff_guidance:g}   "
-        f"dcw {'on' if eff_dcw else 'off'}",
+        f"duration  {duration:g}s   steps {settings.steps}   seed {seed}", err=True
+    )
+    typer.secho(
+        f"sampling  shift {settings.shift:g}   guidance {settings.guidance:g}   "
+        f"dcw {'on' if settings.dcw else 'off'}",
         err=True,
     )
 

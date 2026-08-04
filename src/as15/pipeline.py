@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,6 +13,7 @@ import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 import numpy as np
 
 from .convert import NULL_COND_KEY, convert_dit, convert_vae, resolve_precision
+from .mlx.sampler import check_sampling_options
 from .models import (
     BASE_REPO,
     BASE_REVISION,
@@ -105,6 +107,127 @@ class GenerationResult:
     timings: dict[str, float | str] = field(default_factory=dict)
 
 
+# Duration bounds, shared by the CLI flag and by callers that build a request
+# directly. The lower bound is roughly where a generation stops being a song;
+# the upper is what a 32 GB machine can decode in one pass.
+MIN_DURATION = 10.0
+MAX_DURATION = 600.0
+
+# The time signatures the metas block was trained with.
+VALID_TIME_SIGNATURES = (2, 3, 4, 6)
+
+# ``mx.random.key`` takes a uint64: outside this range it raises TypeError out
+# of the binding, minutes into a run, with no mention of the seed.
+MAX_SEED = 2**64 - 1
+
+
+@dataclass(frozen=True)
+class Settings:
+    """What a request actually runs with, once model defaults are filled in."""
+
+    steps: int
+    guidance: float
+    shift: float
+    dcw: bool
+    compute_dtype: str
+
+
+def _numeric(value: int | str | float) -> float | None:
+    """The number *value* denotes, or None if it is free text."""
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return float(value)
+
+
+def _check_bpm(bpm: int | str | None) -> None:
+    if bpm is None:
+        return
+    if isinstance(bpm, str) and not bpm.strip():
+        raise ValueError("bpm must not be blank; leave it unset instead.")
+    value = _numeric(bpm)
+    # `bpm or 'N/A'` in the metas block renders 0 as *unset*, and a negative or
+    # non-finite tempo reaches the text encoder verbatim. Neither is a tempo.
+    if value is not None and not value > 0:
+        raise ValueError(f"bpm must be greater than zero, got {bpm!r}.")
+
+
+def _check_time_signature(time_signature: str | int | None) -> None:
+    if time_signature is None:
+        return
+    value = _numeric(time_signature)
+    if value not in VALID_TIME_SIGNATURES:
+        allowed = ", ".join(str(t) for t in VALID_TIME_SIGNATURES)
+        raise ValueError(
+            f"time_signature must be one of {allowed}, got {time_signature!r}."
+        )
+
+
+def resolve_settings(spec: ModelSpec, request: GenerationRequest) -> Settings:
+    """Fill in the checkpoint's defaults, rejecting a request that cannot run.
+
+    Both the pipeline and the CLI go through here -- the pipeline before it
+    fetches ~10 GB of weights, the CLI before it prints what it is about to do
+    -- so what the banner reports is what the loop runs, and a request that
+    would otherwise be quietly reinterpreted fails in under a second.
+
+    Every bound below exists because the value is used somewhere that cannot
+    tell a mistake from a setting.
+
+    Raises:
+        ValueError: naming the field, for the CLI to turn into a usage error.
+    """
+    steps = request.steps if request.steps is not None else spec.steps
+    shift = request.shift if request.shift is not None else spec.shift
+    dcw = request.dcw if request.dcw is not None else spec.dcw
+    guidance = request.guidance if request.guidance is not None else spec.guidance
+
+    check_sampling_options(request.sampler, request.infer_method, shift, steps)
+    compute_dtype = resolve_precision(request.precision)
+
+    # Written as a chained comparison rather than `d < MIN or d > MAX`, which
+    # NaN passes: click's `min=`/`max=` are that second form, so `--duration
+    # nan` parses and then reaches `int(duration)` in the metas block.
+    if not MIN_DURATION <= request.duration <= MAX_DURATION:
+        raise ValueError(
+            f"duration must be between {MIN_DURATION:g} and {MAX_DURATION:g} "
+            f"seconds, got {request.duration}."
+        )
+
+    # CFG only engages above 1.0, so 0.5 and -10 run the identical
+    # conditional-only pass the caller gets at 1.0 while being reported as the
+    # value they asked for, and inf enters the guidance arithmetic and takes
+    # the latents non-finite with it.
+    if not math.isfinite(guidance) or guidance < 1.0:
+        raise ValueError(
+            f"guidance must be finite and at least 1.0, where 1.0 means no "
+            f"CFG; got {guidance}."
+        )
+    if not spec.supports_cfg:
+        # Distilled checkpoints are trained to run without a null branch;
+        # forcing CFG on them doubles cost and degrades output.
+        guidance = 1.0
+
+    if request.seed is not None and not 0 <= request.seed <= MAX_SEED:
+        raise ValueError(f"seed must be between 0 and {MAX_SEED}, got {request.seed}.")
+
+    if not request.language.strip():
+        raise ValueError("language must be a code such as 'en', not blank.")
+
+    _check_bpm(request.bpm)
+    _check_time_signature(request.time_signature)
+
+    return Settings(
+        steps=steps,
+        guidance=guidance,
+        shift=shift,
+        dcw=dcw,
+        compute_dtype=compute_dtype,
+    )
+
+
 def _resolve_snapshots(spec: ModelSpec) -> tuple[Snapshot, Snapshot]:
     dit_snapshot = ensure_snapshot(spec.repo_id, spec.revision)
     base_snapshot = ensure_snapshot(
@@ -153,21 +276,12 @@ def generate(
     progress: bool = True,
 ) -> GenerationResult:
     from .conditioning import Conditioner
-    from .mlx.sampler import check_sampling_options, mlx_generate_diffusion
+    from .mlx.sampler import mlx_generate_diffusion
 
-    timings: dict[str, float | str] = {}
-    steps = request.steps if request.steps is not None else spec.steps
-    guidance = request.guidance if request.guidance is not None else spec.guidance
-    shift = request.shift if request.shift is not None else spec.shift
-    dcw = request.dcw if request.dcw is not None else spec.dcw
     # Reject a malformed request here rather than after the snapshots have been
     # fetched and the conditioner has run, which is minutes in.
-    check_sampling_options(request.sampler, request.infer_method, shift, steps)
-    compute_dtype = resolve_precision(request.precision)
-    if not spec.supports_cfg and guidance > 1.0:
-        # Distilled checkpoints are trained to run without a null branch;
-        # forcing CFG on them doubles cost and degrades output.
-        guidance = 1.0
+    settings = resolve_settings(spec, request)
+    timings: dict[str, float | str] = {}
 
     # The peak counter is process-global and never decays, so a second
     # generate() in the same process would otherwise report whichever earlier
@@ -211,13 +325,15 @@ def generate(
         src_latents_shape=(1, cond.latent_frames, LATENT_CHANNELS),
         seed=request.seed,
         infer_method=request.infer_method,
-        shift=shift,
-        infer_steps=steps,
-        guidance_scale=guidance,
-        null_condition_emb_np=cond.null_condition_emb if guidance > 1.0 else None,
+        shift=settings.shift,
+        infer_steps=settings.steps,
+        guidance_scale=settings.guidance,
+        null_condition_emb_np=(
+            cond.null_condition_emb if settings.guidance > 1.0 else None
+        ),
         sampler_mode=request.sampler,
-        dcw_enabled=dcw,
-        compute_dtype=compute_dtype,
+        dcw_enabled=settings.dcw,
+        compute_dtype=settings.compute_dtype,
         disable_tqdm=not progress,
     )
     timings.update(result["time_costs"])

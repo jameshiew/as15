@@ -83,9 +83,9 @@ Useful options:
 | `-m, --model` | `xl-sft` | `xl-sft` (best) or `xl-turbo` (~6x faster) |
 | `-d, --duration` | `120` | Seconds, 10–600 |
 | `-s, --steps` | model default | 50 for sft, 8 for turbo |
-| `-g, --guidance` | `7.0` | CFG scale; ignored by turbo, which is distilled |
-| `--seed` | random | Reuse to reproduce a take |
-| `--bpm`, `--key`, `--time-signature` | unset | Written into the conditioning metadata |
+| `-g, --guidance` | `7.0` | CFG scale, 1.0 or above; 1.0 turns CFG off. Ignored by turbo, which is distilled |
+| `--seed` | random | Reuse to reproduce a take; 0 to 2^64-1 |
+| `--bpm`, `--key`, `--time-signature` | unset | Written into the conditioning metadata. Tempo above zero; time signature 2, 3, 4 or 6 |
 | `--dcw / --no-dcw` | per model | See above; leave alone unless experimenting |
 | `--precision` | `bf16` | `fp32` doubles memory for no measurable gain |
 
