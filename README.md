@@ -142,8 +142,15 @@ Decode is chunked, so peak memory is flat in duration; diffusion time scales wit
 uv run pytest -q
 ```
 
-These pin the conditioning and weight-layout invariants that produce
-correct-looking-but-wrong audio when broken.
+These pin the invariants that produce correct-looking-but-wrong audio when
+broken: the trained prompt format and the context block built around it, the
+sampler's guidance and stepping, the compute dtype, the weight layouts and the
+cache identity. Four of them check a claim against something other than the
+current output — windowed decode against a whole-track decode, the MLX Haar
+transform against its filter bank, and a converted VAE and DiT against a numpy
+implementation of the published architecture. No checkpoint is downloaded and
+no real generation is run, so a change that could move the audio is still
+verified by generating.
 
 The full gate suite -- ruff, tombi, ty, pytest -- is:
 
