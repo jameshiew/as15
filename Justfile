@@ -9,6 +9,7 @@ sync:
 # Lint
 lint:
     uv run ruff check .
+    tombi lint
 
 # Lint, applying autofixes
 fix:
@@ -17,10 +18,12 @@ fix:
 # Format in place
 fmt:
     uv run ruff format .
+    tombi fmt
 
 # Verify formatting without writing (what CI should run)
 fmt-check:
     uv run ruff format --check .
+    tombi fmt --check
 
 # Type check
 types:

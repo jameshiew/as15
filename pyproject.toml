@@ -3,43 +3,41 @@ name = "as15"
 version = "0.1.0"
 description = "Run ACE-Step 1.5 XL music generation on Apple Silicon via MLX"
 readme = "README.md"
-authors = [
-    { name = "James Hiew", email = "james@hiew.net" }
-]
 requires-python = ">=3.14"
+authors = [{ name = "James Hiew", email = "james@hiew.net" }]
 dependencies = [
-    "huggingface-hub>=1.0,<2",
-    "mlx>=0.32.0",
-    "numpy>=2.5.1",
-    "safetensors>=0.8.0",
-    "soundfile>=0.14.0",
-    "torch>=2.9.1",
-    # The checkpoints ship their own modeling code (trust_remote_code), written
-    # against the 4.5x API. It runs unmodified on 5.x -- conditioning output is
-    # bit-identical -- because the two config validators it calls
-    # (`rope_config_validation`, `layer_type_validation`) survive as shims kept
-    # expressly for remote-code models. `layer_type_validation` is slated for
-    # removal in 5.20, hence the cap; past that, those two need shimming here.
-    "transformers>=5.14,<5.20",
-    "tqdm>=4.70.0",
-    "typer>=0.27.1",
-    "einops>=0.8.2",
-    "vector-quantize-pytorch>=1.31.1",
+  "einops>=0.8.2",
+  "huggingface-hub>=1.0,<2",
+  "mlx>=0.32.0",
+  "numpy>=2.5.1",
+  "safetensors>=0.8.0",
+  "soundfile>=0.14.0",
+  "torch>=2.9.1",
+  "tqdm>=4.70.0",
+  # The checkpoints ship their own modeling code (trust_remote_code), written
+  # against the 4.5x API. It runs unmodified on 5.x -- conditioning output is
+  # bit-identical -- because the two config validators it calls
+  # (`rope_config_validation`, `layer_type_validation`) survive as shims kept
+  # expressly for remote-code models. `layer_type_validation` is slated for
+  # removal in 5.20, hence the cap; past that, those two need shimming here.
+  "transformers>=5.14,<5.20",
+  "typer>=0.27.1",
+  "vector-quantize-pytorch>=1.31.1",
 ]
 
 [project.scripts]
 as15 = "as15.cli:app"
 
+[dependency-groups]
+dev = [
+  "pytest>=9.1.1",
+  "ruff>=0.16.1",
+  "ty>=0.0.65",
+]
+
 [build-system]
 requires = ["uv_build>=0.12.1,<0.13.0"]
 build-backend = "uv_build"
-
-[dependency-groups]
-dev = [
-    "pytest>=9.1.1",
-    "ruff>=0.16.1",
-    "ty>=0.0.65",
-]
 
 [tool.ruff]
 target-version = "py314"
@@ -47,20 +45,20 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = [
-    "E",    # pycodestyle errors
-    "W",    # pycodestyle warnings
-    "F",    # pyflakes
-    "I",    # isort
-    "UP",   # pyupgrade
-    "B",    # flake8-bugbear
-    "C4",   # flake8-comprehensions
-    "SIM",  # flake8-simplify
-    "PIE",  # flake8-pie
-    "BLE",  # flake8-blind-except
-    "RUF",  # ruff-specific
+  "E",  # pycodestyle errors
+  "W",  # pycodestyle warnings
+  "F",  # pyflakes
+  "I",  # isort
+  "UP",  # pyupgrade
+  "B",  # flake8-bugbear
+  "C4",  # flake8-comprehensions
+  "SIM",  # flake8-simplify
+  "PIE",  # flake8-pie
+  "BLE",  # flake8-blind-except
+  "RUF",  # ruff-specific
 ]
 ignore = [
-    "E501",  # line length is the formatter's job, not the linter's
+  "E501",  # line length is the formatter's job, not the linter's
 ]
 
 [tool.ty.environment]
