@@ -343,6 +343,44 @@ def test_heun_under_sde_reports_the_sampler_that_ran():
     assert ode["time_costs"]["sampler_mode"] == "heun"
 
 
+def test_asking_for_cfg_without_a_null_embedding_is_rejected():
+    """CFG needs something to guide against.
+
+    The loop turned itself on only when both arrived, so a caller that passed a
+    scale and no null embedding -- or the null embedding of a distilled
+    checkpoint, which ships none -- got the ordinary conditional pass at the
+    cost it expected of a guided one, and was told it had guided at 7.0.
+    """
+    decoder = _ConstantDecoder()
+    with pytest.raises(ValueError, match="null_condition_emb_np"):
+        _run_sampler(decoder, guidance_scale=7.0)
+
+    assert not decoder.timesteps, "the request was checked after the first step"
+
+    # And the pairing that does work is still accepted.
+    _run_sampler(_ConstantDecoder(), **_cfg_kwargs())
+
+
+@pytest.mark.parametrize("guidance", [0.5, float("nan"), float("inf")])
+def test_the_loop_holds_callers_to_the_same_guidance_bound_as_the_cli(guidance):
+    """resolve_settings is not on the path of a caller who drives the loop directly."""
+    with pytest.raises(ValueError, match="guidance"):
+        _run_sampler(
+            _ConstantDecoder(), **{**_cfg_kwargs(), "guidance_scale": guidance}
+        )
+
+
+def test_an_unknown_model_is_a_value_error_not_a_process_exit():
+    """``resolve`` is a library helper, and used to raise SystemExit.
+
+    A bad name therefore tore down the process of anything embedding the
+    package -- a service, a notebook, a test -- with nothing to catch.
+    """
+    with pytest.raises(ValueError, match="Unknown model"):
+        models.resolve("xl-sft-turbo-plus")
+    assert models.resolve("xl-sft") is MODELS["xl-sft"]
+
+
 def test_an_unknown_precision_is_a_value_error_not_a_key_error():
     """``as15 download --precision typo`` used to traceback out of the converter."""
     with pytest.raises(ValueError, match="Unknown precision"):
@@ -472,6 +510,7 @@ CLI_REJECTS = [
     ["--guidance=-10"],
     ["--guidance", "nan"],
     ["--seed=-1"],
+    ["--model", "xl"],
     ["--bpm", "0"],
     ["--time-signature", "5"],
     ["--language", " "],

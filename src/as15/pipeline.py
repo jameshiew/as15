@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import gc
 import json
-import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,7 +12,7 @@ import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 import numpy as np
 
 from .convert import NULL_COND_KEY, convert_dit, convert_vae, resolve_precision
-from .mlx.sampler import check_sampling_options
+from .mlx.sampler import check_guidance, check_sampling_options
 from .models import (
     BASE_REPO,
     BASE_REVISION,
@@ -196,15 +195,9 @@ def resolve_settings(spec: ModelSpec, request: GenerationRequest) -> Settings:
             f"seconds, got {request.duration}."
         )
 
-    # CFG only engages above 1.0, so 0.5 and -10 run the identical
-    # conditional-only pass the caller gets at 1.0 while being reported as the
-    # value they asked for, and inf enters the guidance arithmetic and takes
-    # the latents non-finite with it.
-    if not math.isfinite(guidance) or guidance < 1.0:
-        raise ValueError(
-            f"guidance must be finite and at least 1.0, where 1.0 means no "
-            f"CFG; got {guidance}."
-        )
+    # Shared with the diffusion loop, which enforces the same bound on its own
+    # argument -- a caller reaching it directly gets the same answer.
+    check_guidance(guidance)
     if not spec.supports_cfg:
         # Distilled checkpoints are trained to run without a null branch;
         # forcing CFG on them doubles cost and degrades output.

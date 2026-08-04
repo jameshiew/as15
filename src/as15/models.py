@@ -160,9 +160,17 @@ def load_dit_config(snapshot: Path) -> SimpleNamespace:
 
 
 def resolve(name: str) -> ModelSpec:
+    """The registered checkpoint called *name*.
+
+    Raises:
+        ValueError: If no checkpoint goes by that name. This used to be a
+            SystemExit, which is only ever right at the outermost CLI boundary:
+            anything else embedding the package had its process torn down by an
+            ordinary bad argument, with nothing to catch and no traceback.
+    """
     try:
         return MODELS[name]
     except KeyError:
-        raise SystemExit(
+        raise ValueError(
             f"Unknown model {name!r}. Choose one of: {', '.join(MODELS)}"
         ) from None

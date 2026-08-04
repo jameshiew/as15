@@ -93,6 +93,22 @@ def check_sampling_options(
     check_schedule_options(shift, infer_steps)
 
 
+def check_guidance(guidance: float) -> None:
+    """Reject a guidance scale that does not mean what it says.
+
+    CFG only engages above 1.0, so 0.5 and -10 run the identical
+    conditional-only pass 1.0 gives while being reported back as the value the
+    caller asked for, and inf enters the guidance arithmetic and takes the
+    latents non-finite with it. Shared with the pipeline, which applies it to a
+    request before anything loads.
+    """
+    if not math.isfinite(guidance) or guidance < 1.0:
+        raise ValueError(
+            f"guidance must be finite and at least 1.0, where 1.0 means no CFG; "
+            f"got {guidance}."
+        )
+
+
 def get_timestep_schedule(shift: float, infer_steps: int) -> list[float]:
     """Timesteps for one run: a descending linspace warped by *shift*.
 
@@ -197,8 +213,9 @@ def mlx_generate_diffusion(
         seed: random seed, or None to draw unseeded.
         infer_method: "ode" or "sde".
         shift: timestep shift factor.
-        guidance_scale: CFG guidance strength (>1.0 enables CFG).
-        null_condition_emb_np: [1, 1, D] null condition embedding for CFG.
+        guidance_scale: CFG guidance strength; 1.0 runs unguided.
+        null_condition_emb_np: [1, 1, D] null condition embedding, required
+            whenever ``guidance_scale`` is above 1.0.
         sampler_mode: Sampler algorithm -- ``"euler"`` (first-order, default) or
             ``"heun"`` (second-order predictor-corrector for cleaner output).
         dcw_enabled: Apply the per-step wavelet-domain correction.
@@ -211,14 +228,24 @@ def mlx_generate_diffusion(
         ``"euler"`` when a Heun request degraded under SDE.
 
     Raises:
-        ValueError: If ``sampler_mode``, ``infer_method``, ``infer_steps`` or
-            ``shift`` is outside what this loop supports.
+        ValueError: If ``sampler_mode``, ``infer_method``, ``infer_steps``,
+            ``shift`` or ``guidance_scale`` is outside what this loop supports.
     """
     import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 
     from .dit import MLXCrossAttentionCache
 
     check_sampling_options(sampler_mode, infer_method, shift, infer_steps)
+    check_guidance(guidance_scale)
+    # Guiding needs something to guide against. Asking for CFG without a null
+    # embedding used to fall through to the ordinary conditional pass, so a
+    # distilled checkpoint -- which ships no null branch -- ran unguided while
+    # the caller was told it was guiding at 7.0.
+    if guidance_scale > 1.0 and null_condition_emb_np is None:
+        raise ValueError(
+            f"guidance_scale={guidance_scale} needs a null_condition_emb_np to "
+            f"guide against; pass one, or guidance_scale=1.0 to run without CFG."
+        )
 
     # Heun's corrector is an ODE construction; under SDE every step is Euler.
     # Track the sampler that will actually run, so the warning below and the
@@ -254,7 +281,7 @@ def mlx_generate_diffusion(
     C = src_latents_shape[2]
 
     # ---- CFG setup ----
-    do_cfg = guidance_scale > 1.0 and null_condition_emb_np is not None
+    do_cfg = guidance_scale > 1.0
     if do_cfg:
         null_cond = mx.array(null_condition_emb_np).astype(dt)
         null_expanded = mx.broadcast_to(null_cond, enc_hs.shape)

@@ -10,7 +10,7 @@ from typing import Annotated
 import typer
 
 from .convert import PRECISIONS
-from .models import DEFAULT_MODEL, MODELS, resolve
+from .models import DEFAULT_MODEL, MODELS, ModelSpec, resolve
 from .pipeline import (
     MAX_DURATION,
     MIN_DURATION,
@@ -29,6 +29,19 @@ app = typer.Typer(
 
 def _err(message: str) -> None:
     typer.secho(message, fg=typer.colors.RED, err=True)
+
+
+def _resolve_model(name: str) -> ModelSpec:
+    """The checkpoint *name* names, as a usage error when it names none.
+
+    ``resolve`` is a library helper and raises ValueError; turning it into a
+    BadParameter here is what keeps an unknown ``--model`` looking like every
+    other bad option rather than like a crash.
+    """
+    try:
+        return resolve(name)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
 
 
 def _read_lyrics(lyrics: str | None, lyrics_file: Path | None) -> str:
@@ -129,7 +142,7 @@ def sing(
     ] = False,
 ) -> None:
     """Generate a song from a style prompt and lyrics."""
-    spec = resolve(model)
+    spec = _resolve_model(model)
     lyrics_text = _read_lyrics(lyrics, lyrics_file)
 
     if seed is None:
@@ -239,7 +252,7 @@ def download(
     if precision not in PRECISIONS:
         raise typer.BadParameter(f"--precision must be one of: {', '.join(PRECISIONS)}")
 
-    spec = resolve(model)
+    spec = _resolve_model(model)
     dit_snapshot, base_snapshot = _resolve_snapshots(spec)
     dit_path = convert_dit(dit_snapshot, precision)
     vae_path = convert_vae(base_snapshot)
