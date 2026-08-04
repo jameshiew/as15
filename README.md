@@ -116,11 +116,11 @@ before the DiT loads to keep peak memory down. Everything that runs per-step is 
 
 DiT weights are published as fp32 (~20 GB); they are converted once to bf16 MLX
 safetensors (~8.3 GB) under
-`~/.cache/as15/<checkpoint>/<commit>/dit-v<converter>-<precision>.safetensors`
-(override the root with `AS15_CACHE`). Commit and converter version are part of
-the path, and repeated in a sidecar `.json` that is checked before a cached file
-is reused — a cache built from other bytes still loads, it just generates worse
-audio, so it must not be silently trusted. The port was verified against the
+`~/.cache/as15/<repo>-<digest>/<commit>/dit-v<converter>-<precision>.safetensors`
+(override the root with `AS15_CACHE`). Repo, commit, converter version and
+precision are all part of the path, and repeated in a sidecar `.json` that is
+checked before a cached file is reused — a cache built from other bytes still
+loads, it just generates worse audio, so it must not be silently trusted. The port was verified against the
 reference PyTorch DiT: **0.999378** output correlation on identical inputs, the
 residual being bf16 rounding. bf16 and fp32 generations are spectrally
 indistinguishable, so bf16 is the default.

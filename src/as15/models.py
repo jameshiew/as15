@@ -119,10 +119,6 @@ class Snapshot:
     revision: str
     path: Path
 
-    @property
-    def cache_name(self) -> str:
-        return self.repo_id.split("/")[-1]
-
 
 def ensure_snapshot(
     repo_id: str, revision: str, allow_patterns: list[str] | None = None

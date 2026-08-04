@@ -1274,12 +1274,12 @@ def test_cache_paths_separate_every_identity_component(monkeypatch, tmp_path):
     """Repo, commit, converter version and precision must not alias."""
     monkeypatch.setenv("AS15_CACHE", str(tmp_path))
     paths = {
-        convert.dit_cache_path("acestep-v15-xl-sft", "aaaa", "bf16"),
-        convert.dit_cache_path("acestep-v15-xl-sft", "aaaa", "fp32"),
-        convert.dit_cache_path("acestep-v15-xl-sft", "bbbb", "bf16"),
-        convert.dit_cache_path("acestep-v15-xl-turbo", "aaaa", "bf16"),
-        convert.vae_cache_path("aaaa"),
-        convert.vae_cache_path("bbbb"),
+        convert.dit_cache_path("ACE-Step/acestep-v15-xl-sft", "aaaa", "bf16"),
+        convert.dit_cache_path("ACE-Step/acestep-v15-xl-sft", "aaaa", "fp32"),
+        convert.dit_cache_path("ACE-Step/acestep-v15-xl-sft", "bbbb", "bf16"),
+        convert.dit_cache_path("ACE-Step/acestep-v15-xl-turbo", "aaaa", "bf16"),
+        convert.vae_cache_path("ACE-Step/Ace-Step1.5", "aaaa"),
+        convert.vae_cache_path("ACE-Step/Ace-Step1.5", "bbbb"),
     }
     assert len(paths) == 6
     # The converter version is in the filename, so a bump orphans the old file
@@ -1287,14 +1287,44 @@ def test_cache_paths_separate_every_identity_component(monkeypatch, tmp_path):
     assert f"-v{convert.DIT_CONVERTER_VERSION}-" in (
         convert.dit_cache_path("m", "aaaa", "bf16").name
     )
-    assert f"-v{convert.VAE_CONVERTER_VERSION}-" in convert.vae_cache_path("aaaa").name
+    assert f"-v{convert.VAE_CONVERTER_VERSION}-" in (
+        convert.vae_cache_path("m", "aaaa").name
+    )
+
+
+def test_the_whole_repo_id_names_the_cache_directory(monkeypatch, tmp_path):
+    """Two repos that share a last component must not share a cache.
+
+    They did: the directory was ``repo_id.split("/")[-1]``, so at the same
+    commit and precision these two named one file. The manifest kept either
+    from loading the other's weights, but only by reconverting ~8.3 GB every
+    time the other was used -- and it is checked, not held, so a concurrent
+    run can still swap the file between the check and the open.
+    """
+    monkeypatch.setenv("AS15_CACHE", str(tmp_path))
+    a = convert.dit_cache_path("org-a/model", "aaaa", "bf16")
+    b = convert.dit_cache_path("org-b/model", "aaaa", "bf16")
+    assert a.parent.parent != b.parent.parent
+
+    # Flattening alone would not have been enough either.
+    assert convert._repo_dir("a-b/c") != convert._repo_dir("a/b-c")
+    # The readable part survives, so the directory is still greppable.
+    assert convert._repo_dir("org-a/model").startswith("org-a-model-")
 
 
 def test_a_revision_is_flattened_into_one_path_component(monkeypatch, tmp_path):
     monkeypatch.setenv("AS15_CACHE", str(tmp_path))
     path = convert.dit_cache_path("m", "refs/pr/7", "bf16")
     assert path.parent.name == "refs-pr-7"
-    assert path.parent.parent.name == "m"
+    assert path.parent.parent.name == convert._repo_dir("m")
+
+
+def test_no_identity_component_can_escape_the_cache_root(monkeypatch, tmp_path):
+    """Both components are attacker-adjacent: they come from a repo ID."""
+    monkeypatch.setenv("AS15_CACHE", str(tmp_path))
+    path = convert.dit_cache_path("../../etc", "../..", "bf16")
+    assert tmp_path in path.resolve().parents
+    assert convert._path_safe("") == "unknown"
 
 
 def _dit_manifest(snapshot: Snapshot, precision: str = "bf16") -> dict:
@@ -1315,7 +1345,7 @@ def test_cache_is_reused_only_when_the_manifest_matches(monkeypatch, tmp_path):
     """
     monkeypatch.setenv("AS15_CACHE", str(tmp_path))
     snapshot = Snapshot("ACE-Step/acestep-v15-xl-sft", "a" * 40, tmp_path / "snap")
-    out = convert.dit_cache_path(snapshot.cache_name, snapshot.revision, "bf16")
+    out = convert.dit_cache_path(snapshot.repo_id, snapshot.revision, "bf16")
     out.parent.mkdir(parents=True)
     out.write_bytes(b"not really safetensors")
 
@@ -1382,7 +1412,7 @@ def test_a_failed_write_leaves_neither_a_partial_cache_nor_debris(
     monkeypatch, tmp_path
 ):
     monkeypatch.setenv("AS15_CACHE", str(tmp_path))
-    out = convert.vae_cache_path("a" * 40)
+    out = convert.vae_cache_path(BASE_REPO, "a" * 40)
     out.parent.mkdir(parents=True)
 
     def explode(tmp: Path) -> None:
@@ -1399,7 +1429,7 @@ def test_a_failed_write_leaves_neither_a_partial_cache_nor_debris(
 def test_shared_vae_cache_is_keyed_on_the_base_repo(monkeypatch, tmp_path):
     """The VAE is shared across checkpoints, so only the base repo pins it."""
     monkeypatch.setenv("AS15_CACHE", str(tmp_path))
-    out = convert.vae_cache_path(BASE_REVISION)
+    out = convert.vae_cache_path(BASE_REPO, BASE_REVISION)
     out.parent.mkdir(parents=True)
     out.write_bytes(b"")
     manifest = {
@@ -1411,7 +1441,13 @@ def test_shared_vae_cache_is_keyed_on_the_base_repo(monkeypatch, tmp_path):
     }
     convert._manifest_path(out).write_text(json.dumps(manifest))
     assert convert._cache_hit(out, manifest)
-    assert not convert._cache_hit(convert.vae_cache_path("c" * 40), manifest)
+    assert not convert._cache_hit(convert.vae_cache_path(BASE_REPO, "c" * 40), manifest)
+    # Both assets are named the same way, so the DiT and the VAE of one repo
+    # share a directory and differ by filename rather than by scheme.
+    assert (
+        convert.vae_cache_path(BASE_REPO, BASE_REVISION).parent
+        == convert.dit_cache_path(BASE_REPO, BASE_REVISION, "bf16").parent
+    )
 
 
 # --- latent geometry -----------------------------------------------------

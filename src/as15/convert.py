@@ -15,7 +15,9 @@ bfloat16 dtype (the VAE ships bf16).
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
+import re
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -124,9 +126,39 @@ def _apply_layout(value: mx.array, layout: str) -> mx.array:
 # ---------------------------------------------------------------------------
 
 
+_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
+
+
 def _path_safe(component: str) -> str:
-    """Flatten a revision into a single path component."""
-    return component.replace("/", "-").replace("\\", "-") or "unknown"
+    """Flatten one identity component into a single path component.
+
+    Aggressive on purpose: a revision is normally a hex commit but may be a
+    branch or tag, and a repo ID is whatever the caller passed. Leading dots
+    go too, so no component can be ``..`` and walk out of the cache root.
+    """
+    return _UNSAFE.sub("-", component).lstrip(".") or "unknown"
+
+
+def _repo_dir(repo_id: str) -> str:
+    """The cache directory for *repo_id*, and for no other repo.
+
+    The path used to carry only the last component of the repo ID, on the
+    reasoning that it reads better and the manifest catches a mismatch anyway.
+    It does catch it -- but catching it is a ~8.3 GB reconversion, and
+    ``org-a/model`` and ``org-b/model`` at the same commit and precision named
+    one file, so two such checkpoints in alternation would invalidate and
+    overwrite each other forever rather than each keeping a cache. Worse, the
+    manifest check and the load are not one operation: another process can
+    replace the file between them, so what is opened is not what was checked.
+
+    Flattening the full ID is lossy in the other direction -- ``a-b/c`` and
+    ``a/b-c`` flatten alike -- so a digest of the exact string goes on the end.
+    Four bytes is far more than enough to separate a handful of repos, and a
+    deliberate collision only puts two repos back in the directory they shared
+    before, where the manifest still stands between them and a bad cache hit.
+    """
+    digest = hashlib.blake2b(repo_id.encode(), digest_size=4).hexdigest()
+    return f"{_path_safe(repo_id)}-{digest}"
 
 
 def _manifest_path(weights: Path) -> Path:
@@ -184,12 +216,13 @@ def _write_cache(
     )
 
 
-def dit_cache_path(cache_name: str, revision: str, precision: str) -> Path:
-    return (
-        cache_root()
-        / cache_name
-        / _path_safe(revision)
-        / f"dit-v{DIT_CONVERTER_VERSION}-{precision}.safetensors"
+def _asset_path(repo_id: str, revision: str, filename: str) -> Path:
+    return cache_root() / _repo_dir(repo_id) / _path_safe(revision) / filename
+
+
+def dit_cache_path(repo_id: str, revision: str, precision: str) -> Path:
+    return _asset_path(
+        repo_id, revision, f"dit-v{DIT_CONVERTER_VERSION}-{precision}.safetensors"
     )
 
 
@@ -206,7 +239,7 @@ def convert_dit(
     # file that can never hit, and only fail once the conversion reached it.
     dtype = getattr(mx, resolve_precision(precision))
 
-    out = dit_cache_path(snapshot.cache_name, snapshot.revision, precision)
+    out = dit_cache_path(snapshot.repo_id, snapshot.revision, precision)
     manifest: dict[str, object] = {
         "asset": "dit",
         "converter_version": DIT_CONVERTER_VERSION,
@@ -268,12 +301,16 @@ def _fuse_weight_norm(g: mx.array, v: mx.array, eps: float = 1e-9) -> mx.array:
     return g.astype(mx.float32) * v / (norm + eps)
 
 
-def vae_cache_path(revision: str) -> Path:
-    return (
-        cache_root()
-        / "vae"
-        / _path_safe(revision)
-        / f"vae-v{VAE_CONVERTER_VERSION}-fp32.safetensors"
+def vae_cache_path(repo_id: str, revision: str) -> Path:
+    """Where the converted VAE for *repo_id* at *revision* is cached.
+
+    The VAE lives in the shared base repo and every checkpoint decodes with
+    it, so this is one file for all of them -- but it is one file *per base
+    repo*, named the same way as the DiT rather than under a fixed ``vae/``
+    directory, so a second base repo cannot land on it.
+    """
+    return _asset_path(
+        repo_id, revision, f"vae-v{VAE_CONVERTER_VERSION}-fp32.safetensors"
     )
 
 
@@ -282,7 +319,7 @@ def convert_vae(base: Snapshot, force: bool = False) -> Path:
 
     The VAE stays fp32: it is only 337 MB and runs once per generation.
     """
-    out = vae_cache_path(base.revision)
+    out = vae_cache_path(base.repo_id, base.revision)
     manifest: dict[str, object] = {
         "asset": "vae",
         "converter_version": VAE_CONVERTER_VERSION,
