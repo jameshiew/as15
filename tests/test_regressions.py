@@ -134,16 +134,23 @@ STEPS = len(SCHEDULE)
 NOISE_SHAPE = (1, 4, 8)
 
 
-def _run_sampler(decoder, compute_dtype: str = "float32", **kwargs):
+def _run_sampler(
+    decoder,
+    compute_dtype: str = "float32",
+    batch: int = NOISE_SHAPE[0],
+    seed: int | list[int] | None = 0,
+    **kwargs,
+):
     from as15.mlx.sampler import mlx_generate_diffusion
 
-    b, t, c = NOISE_SHAPE
+    _, t, c = NOISE_SHAPE
+    b = batch
     return mlx_generate_diffusion(
         decoder,
         encoder_hidden_states_np=np.zeros((b, 3, 6), dtype=np.float32),
         context_latents_np=np.zeros((b, t, c), dtype=np.float32),
-        src_latents_shape=NOISE_SHAPE,
-        seed=0,
+        src_latents_shape=(b, t, c),
+        seed=seed,
         infer_steps=STEPS,
         shift=1.0,
         dcw_enabled=False,
@@ -225,25 +232,70 @@ def test_the_last_interval_still_lands_on_x0():
     assert np.allclose(result["target_latents"], noise - SCHEDULE[0], atol=1e-5)
 
 
-def test_sde_draws_no_noise_for_the_interval_that_ends_at_zero(monkeypatch):
-    """``t_next == 0`` scales the fresh noise away, so it must not be drawn.
-
-    Drawing it anyway would advance MLX's implicit PRNG state once per
-    generation for nothing.
-    """
+def _spy_on_noise_draws(monkeypatch):
+    """Record whether each ``mx.random.normal`` call carried an explicit key."""
     real_normal = mx.random.normal
-    keyless = []
+    keyed: list[bool] = []
 
     def spy(shape, *args, key=None, **kw):
-        if key is None:
-            keyless.append(shape)
+        keyed.append(key is not None)
         return real_normal(shape, *args, key=key, **kw)
 
     monkeypatch.setattr(mx.random, "normal", spy)
+    return keyed
+
+
+def test_sde_draws_no_noise_for_the_interval_that_ends_at_zero(monkeypatch):
+    """``t_next == 0`` scales the fresh noise away, so it must not be drawn."""
+    draws = _spy_on_noise_draws(monkeypatch)
 
     _run_sampler(_ConstantDecoder(), infer_method="sde")
 
-    assert len(keyless) == STEPS - 1
+    # One initial draw, then one per interval except the one ending at zero.
+    assert len(draws) == 1 + (STEPS - 1)
+
+
+def test_every_sde_noise_draw_comes_from_the_seed(monkeypatch):
+    """A seeded request must not touch MLX's implicit global PRNG state."""
+    draws = _spy_on_noise_draws(monkeypatch)
+
+    _run_sampler(_ConstantDecoder(), infer_method="sde")
+
+    assert draws and all(draws)
+
+
+def test_an_unrelated_draw_between_two_sde_runs_does_not_move_the_result():
+    """The seed alone has to fix an SDE trajectory.
+
+    The per-interval noise used to come off the implicit global stream, so an
+    earlier generation -- or any other ``mx.random`` call in the process --
+    shifted every step of the next run at the same seed.
+    """
+    first = _run_sampler(_ConstantDecoder(), infer_method="sde")["target_latents"]
+    mx.eval(mx.random.normal((3, 5)))
+    second = _run_sampler(_ConstantDecoder(), infer_method="sde")["target_latents"]
+
+    assert np.array_equal(first, second)
+
+
+def test_a_list_of_seeds_keeps_the_sde_batch_items_independent():
+    """Per-item seeds have to survive into the per-step noise, not just the first draw."""
+    shared, distinct = 7, 9
+    both = _run_sampler(
+        _ConstantDecoder(),
+        infer_method="sde",
+        batch=2,
+        seed=[shared, distinct],
+    )["target_latents"]
+    alone = _run_sampler(
+        _ConstantDecoder(),
+        infer_method="sde",
+        batch=2,
+        seed=[shared, shared],
+    )["target_latents"]
+
+    assert np.array_equal(both[0], alone[0])
+    assert not np.array_equal(both[1], alone[1])
 
 
 # --- input validation ----------------------------------------------------

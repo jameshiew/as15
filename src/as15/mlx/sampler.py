@@ -447,32 +447,68 @@ def mlx_generate_diffusion(
     momentum_state: dict | None = {} if do_cfg else None
 
     # ---- Noise preparation ----
-    def _draw_noise(_seed):
-        if _seed is None:
-            return mx.random.normal((bsz, T, C)).astype(dt)
-        if isinstance(_seed, list):
-            parts = []
-            for s in _seed:
-                if s is None or s < 0:
-                    parts.append(mx.random.normal((1, T, C)))
-                else:
-                    key = mx.random.key(int(s))
-                    parts.append(mx.random.normal((1, T, C), key=key))
-            return mx.concatenate(parts, axis=0).astype(dt)
-        key = mx.random.key(int(_seed))
-        return mx.random.normal((bsz, T, C), key=key).astype(dt)
+    def _keys_for(_seed):
+        """Base key(s) for *_seed*: one for the batch, or one per batch item.
 
-    noise = _draw_noise(seed)
+        ``None`` marks an unseeded draw, which stays on MLX's implicit global
+        stream -- there is no reproducibility to preserve for one.
+        """
+        if _seed is None:
+            return None
+        if isinstance(_seed, list):
+            return [
+                None if s is None or s < 0 else mx.random.key(int(s)) for s in _seed
+            ]
+        return mx.random.key(int(_seed))
+
+    def _split_keys(keys, count):
+        """One independent key per step, keeping any per-item split intact."""
+        if keys is None:
+            return [None] * count
+        if isinstance(keys, list):
+            streams = [
+                [None] * count if k is None else list(mx.random.split(k, count))
+                for k in keys
+            ]
+            return [[stream[i] for stream in streams] for i in range(count)]
+        return list(mx.random.split(keys, count))
+
+    def _draw_noise(keys):
+        """Draw [B, T, C] noise from a batch key, per-item keys, or unseeded."""
+        if keys is None:
+            return mx.random.normal((bsz, T, C)).astype(dt)
+        if isinstance(keys, list):
+            parts = [
+                mx.random.normal((1, T, C))
+                if k is None
+                else mx.random.normal((1, T, C), key=k)
+                for k in keys
+            ]
+            return mx.concatenate(parts, axis=0).astype(dt)
+        return mx.random.normal((bsz, T, C), key=keys).astype(dt)
+
+    seed_keys = _keys_for(seed)
+    noise = _draw_noise(seed_keys)
     # Retake mixing: variance-preserving blend with an independent noise draw.
     # v=0 -> noise unchanged; v=1 -> equivalent to using retake_seed as the main seed.
     if retake_variance > 0.0:
-        retake_noise = _draw_noise(retake_seed)
+        retake_noise = _draw_noise(_keys_for(retake_seed))
         v_rad = retake_variance * (math.pi / 2.0)
         noise = math.cos(v_rad) * noise + math.sin(v_rad) * retake_noise
 
     # ---- Timestep schedule ----
     t_schedule_list = get_timestep_schedule(shift, timesteps, infer_steps=infer_steps)
     num_steps = len(t_schedule_list)
+
+    # Keys for the fresh noise every SDE interval draws. Those draws used to go
+    # through MLX's implicit global PRNG state, so the request seed fixed only
+    # the initial noise: any other ``mx.random`` call in the process -- an
+    # earlier generation, a caller's own draw between two requests -- moved the
+    # whole SDE trajectory. Split an explicit stream off the seed instead, one
+    # per batch item so a list of seeds keeps the items independent. The initial
+    # draw above still uses the base key itself, so its values, and with them
+    # the entire ODE path, are unchanged.
+    step_keys = _split_keys(seed_keys, num_steps) if infer_method == "sde" else []
 
     cover_steps = int(num_steps * audio_cover_strength)
 
@@ -673,10 +709,9 @@ def mlx_generate_diffusion(
             t_unsq = mx.full((bsz, 1, 1), current_t, dtype=dt)
             pred_clean = xt - vt * t_unsq
             # next_t == 0 on the last interval: the blend is then all clean
-            # sample, so skip the draw rather than scale it away -- MLX's
-            # implicit PRNG state would advance for nothing.
+            # sample, so skip the draw rather than scale it away.
             if next_t > 0.0:
-                new_noise = mx.random.normal(xt.shape).astype(dt)
+                new_noise = _draw_noise(step_keys[step_idx])
                 xt = next_t * new_noise + (1.0 - next_t) * pred_clean
             else:
                 xt = pred_clean
