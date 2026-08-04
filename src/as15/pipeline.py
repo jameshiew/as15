@@ -297,62 +297,74 @@ def generate(
     conditioner = Conditioner(dit_snapshot.path, base_snapshot.path, device=device)
     timings["load_conditioner"] = time.time() - t0
 
+    # Every stage from here on hands its memory back on the way out, failure
+    # included. Only the successful path used to, which is enough for the CLI
+    # -- the process exits either way -- but leaves a caller that catches the
+    # failure and retries holding the whole dead attempt, so the retry dies of
+    # an out-of-memory naming some entirely different stage.
     t0 = time.time()
-    cond = conditioner.build(
-        style_prompt=request.style_prompt,
-        lyrics=request.lyrics,
-        duration=request.duration,
-        language=request.language,
-        bpm=request.bpm,
-        key_scale=request.key_scale,
-        time_signature=request.time_signature,
-    )
-    timings["condition"] = time.time() - t0
-
-    conditioner.release()
+    with conditioner:
+        cond = conditioner.build(
+            style_prompt=request.style_prompt,
+            lyrics=request.lyrics,
+            duration=request.duration,
+            language=request.language,
+            bpm=request.bpm,
+            key_scale=request.key_scale,
+            time_signature=request.time_signature,
+        )
+        timings["condition"] = time.time() - t0
     del conditioner
-    gc.collect()
 
     # --- Diffusion (MLX) ---------------------------------------------------
-    t0 = time.time()
-    dit = _load_dit(dit_snapshot, request.precision)
-    timings["load_dit"] = time.time() - t0
+    dit = None
+    try:
+        t0 = time.time()
+        dit = _load_dit(dit_snapshot, request.precision)
+        timings["load_dit"] = time.time() - t0
 
-    result = mlx_generate_diffusion(
-        mlx_decoder=dit,
-        encoder_hidden_states_np=cond.encoder_hidden_states,
-        context_latents_np=cond.context_latents,
-        src_latents_shape=(1, cond.latent_frames, LATENT_CHANNELS),
-        seed=request.seed,
-        infer_method=request.infer_method,
-        shift=settings.shift,
-        infer_steps=settings.steps,
-        guidance_scale=settings.guidance,
-        null_condition_emb_np=(
-            cond.null_condition_emb if settings.guidance > 1.0 else None
-        ),
-        sampler_mode=request.sampler,
-        dcw_enabled=settings.dcw,
-        compute_dtype=settings.compute_dtype,
-        disable_tqdm=not progress,
-    )
-    timings.update(result["time_costs"])
-    latents = result["target_latents"]
-
-    del dit
-    mx.clear_cache()
-    gc.collect()
+        result = mlx_generate_diffusion(
+            mlx_decoder=dit,
+            encoder_hidden_states_np=cond.encoder_hidden_states,
+            context_latents_np=cond.context_latents,
+            src_latents_shape=(1, cond.latent_frames, LATENT_CHANNELS),
+            seed=request.seed,
+            infer_method=request.infer_method,
+            shift=settings.shift,
+            infer_steps=settings.steps,
+            guidance_scale=settings.guidance,
+            null_condition_emb_np=(
+                cond.null_condition_emb if settings.guidance > 1.0 else None
+            ),
+            sampler_mode=request.sampler,
+            dcw_enabled=settings.dcw,
+            compute_dtype=settings.compute_dtype,
+            disable_tqdm=not progress,
+        )
+        timings.update(result["time_costs"])
+        latents = result["target_latents"]
+    finally:
+        # Same ordering argument as Conditioner.release(): collect first so
+        # that every dead array has returned its buffer to MLX's cache, then
+        # clear the cache so the buffers go back to the OS.
+        del dit
+        gc.collect()
+        mx.clear_cache()
 
     # --- Decode (MLX) ------------------------------------------------------
-    t0 = time.time()
-    vae = _load_vae(base_snapshot)
-    audio = tiled_decode(vae, mx.array(latents).astype(mx.float32))
-    mx.eval(audio)
-    timings["decode"] = time.time() - t0
+    vae = audio = None
+    try:
+        t0 = time.time()
+        vae = _load_vae(base_snapshot)
+        audio = tiled_decode(vae, mx.array(latents).astype(mx.float32))
+        mx.eval(audio)
+        timings["decode"] = time.time() - t0
 
-    audio_np = np.array(audio[0])  # [samples, channels]
-    del vae, audio
-    mx.clear_cache()
+        audio_np = np.array(audio[0])  # [samples, channels]
+    finally:
+        del vae, audio
+        gc.collect()
+        mx.clear_cache()
 
     timings["peak_memory_gb"] = mx.get_peak_memory() / 1e9
     return GenerationResult(

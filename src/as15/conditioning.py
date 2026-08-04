@@ -17,6 +17,7 @@ text2music their output is discarded by ``torch.where(is_covers > 0, ...)``.
 from __future__ import annotations
 
 import copy
+import gc
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -229,6 +230,20 @@ class Conditioner:
             lyrics_text=lyrics_text,
         )
 
+    def __enter__(self) -> Conditioner:
+        """Use as a context manager to bound the torch stage's lifetime.
+
+        The 4.17 B MLX DiT is loaded straight after this, so the ~2.4 GB of
+        torch models held here have to go back whether conditioning succeeded
+        or raised -- a caller that catches the failure and retries otherwise
+        starts the next attempt that much closer to the memory ceiling, and
+        fails somewhere with no obvious connection to the first failure.
+        """
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.release()
+
     def release(self) -> None:
         """Drop the torch models so their memory is free before MLX loads.
 
@@ -239,6 +254,11 @@ class Conditioner:
         """
         for name in ("encoder", "text_encoder", "silence_latent"):
             self.__dict__.pop(name, None)
+        # Collect before emptying the cache rather than after: a tensor whose
+        # last reference is cyclic garbage is still allocated when
+        # empty_cache() runs, so its block stays checked out and the call
+        # returns less than it looks like it does.
+        gc.collect()
         if self.device.type == "mps":
             torch.mps.empty_cache()
 

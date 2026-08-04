@@ -599,6 +599,141 @@ def test_the_cli_accepts_the_smallest_valid_step_count(monkeypatch, tmp_path):
     assert seen["request"].shift == 2.0
 
 
+# --- stage cleanup -------------------------------------------------------
+
+
+class _StageFailure(RuntimeError):
+    """Whatever goes wrong inside a stage: an OOM, a bad file, a bug."""
+
+
+def test_leaving_the_conditioner_block_releases_it(monkeypatch):
+    """The pipeline delegates the torch stage's lifetime to the with-block.
+
+    Built with ``__new__`` so the test costs nothing: release() is stubbed and
+    a conditioner that never loaded a model has nothing to release anyway.
+    """
+    released: list[bool] = []
+    conditioner = conditioning.Conditioner.__new__(conditioning.Conditioner)
+    monkeypatch.setattr(conditioner, "release", lambda: released.append(True))
+
+    with conditioner as entered:
+        assert entered is conditioner
+    assert released == [True]
+
+
+def _run_with_stub_stages(
+    monkeypatch, log: list[str], fail_in: str | None = None
+) -> None:
+    """Run generate() with every stage stubbed, failing in one of them.
+
+    *log* collects what the pipeline loaded, ran and handed back, in order, so
+    that the cleanup can be asserted on -- including when generate() raises --
+    without a checkpoint or 10 GB of weights.
+    """
+    from as15 import pipeline
+    from as15.mlx import sampler
+
+    def stage(name: str) -> None:
+        log.append(name)
+        if fail_in == name:
+            raise _StageFailure(name)
+
+    class FakeConditioner:
+        def __init__(self, *args, **kwargs):
+            log.append("conditioner loaded")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            self.release()
+
+        def release(self):
+            log.append("conditioner released")
+
+        def build(self, **kwargs):
+            stage("condition")
+            return conditioning.Conditioning(
+                encoder_hidden_states=np.zeros((1, 1, 8), np.float32),
+                context_latents=np.zeros(
+                    (1, 2, 2 * models.LATENT_CHANNELS), np.float32
+                ),
+                null_condition_emb=np.zeros((1, 1, 8), np.float32),
+                latent_frames=2,
+                text_prompt="",
+                lyrics_text="",
+            )
+
+    class FakeVAE:
+        def decode(self, latents):
+            stage("decode")
+            return mx.zeros((1, latents.shape[1] * models.VAE_HOP, 2))
+
+    def fake_diffusion(**kwargs):
+        stage("diffuse")
+        return {
+            "target_latents": np.zeros((1, 2, models.LATENT_CHANNELS), np.float32),
+            "time_costs": {},
+        }
+
+    snapshot = Snapshot(
+        repo_id="fake/repo", revision="0" * 40, path=Path("/nonexistent")
+    )
+    monkeypatch.setattr(pipeline, "_resolve_snapshots", lambda _: (snapshot, snapshot))
+    monkeypatch.setattr(conditioning, "Conditioner", FakeConditioner)
+    monkeypatch.setattr(sampler, "mlx_generate_diffusion", fake_diffusion)
+    monkeypatch.setattr(pipeline, "_load_dit", lambda *args: log.append("dit loaded"))
+    monkeypatch.setattr(pipeline, "_load_vae", lambda *args: FakeVAE())
+    # The piece of cleanup with an observable effect: whether the buffers a
+    # stage allocated go back to the OS or stay checked out in MLX's cache.
+    monkeypatch.setattr(mx, "clear_cache", lambda: log.append("mlx cache cleared"))
+
+    pipeline.generate(MODELS["xl-sft"], _request(), progress=False)
+
+
+def test_every_stage_hands_its_memory_back_when_it_finishes(monkeypatch):
+    """Positive control for the failure cases below.
+
+    Stubs that stopped reaching a stage would pass those vacuously.
+    """
+    log: list[str] = []
+    _run_with_stub_stages(monkeypatch, log)
+    assert log == [
+        "conditioner loaded",
+        "condition",
+        "conditioner released",
+        "dit loaded",
+        "diffuse",
+        "mlx cache cleared",
+        "decode",
+        "mlx cache cleared",
+    ]
+
+
+@pytest.mark.parametrize(
+    "fail_in,cleanup",
+    [
+        ("condition", "conditioner released"),
+        ("diffuse", "mlx cache cleared"),
+        ("decode", "mlx cache cleared"),
+    ],
+)
+def test_a_stage_hands_its_memory_back_when_it_fails(monkeypatch, fail_in, cleanup):
+    """A failed generation must not leave the next one short of memory.
+
+    Cleanup used to sit on the success path only: a conditioning failure kept
+    the ~2.4 GB of torch models and the MPS pool, and a failure in diffusion
+    or decode left MLX's buffer cache holding the whole attempt. In-process
+    callers -- a retry, a service, a test -- then hit an out-of-memory in a
+    stage that had nothing to do with the original failure.
+    """
+    log: list[str] = []
+    with pytest.raises(_StageFailure):
+        _run_with_stub_stages(monkeypatch, log, fail_in=fail_in)
+
+    assert log[-2:] == [fail_in, cleanup]
+
+
 # --- compute dtype -------------------------------------------------------
 
 
