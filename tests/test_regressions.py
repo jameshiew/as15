@@ -54,6 +54,46 @@ def test_turbo_does_not_use_cfg():
     assert MODELS["xl-sft"].supports_cfg is True
 
 
+# --- APG guidance --------------------------------------------------------
+
+
+def test_apg_momentum_decays_rather_than_accumulates():
+    """``running = diff + (-0.75) * running``, per upstream's MomentumBuffer.
+
+    Getting the sign wrong sums every past guidance difference with weight
+    +1.0 instead, so the trajectory diverges from the reference after the
+    first step -- on every xl-sft generation, which guides at 7.0 by default.
+    """
+    from as15.mlx.sampler import APG_MOMENTUM, _mlx_apg_forward
+
+    assert APG_MOMENTUM == -0.75
+
+    first = mx.array([[[1.0, 0.0]]])
+    second = mx.array([[[0.0, 1.0]]])
+    zero = mx.zeros((1, 1, 2))
+
+    state: dict = {}
+    # norm_threshold=0 keeps the running average out of the clamp, so the
+    # state after each call is exactly the recurrence under test.
+    _mlx_apg_forward(first, zero, 7.0, state, norm_threshold=0.0)
+    assert np.allclose(np.array(state["running"]), np.array(first))
+
+    _mlx_apg_forward(second, zero, 7.0, state, norm_threshold=0.0)
+    expected = np.array(second) + APG_MOMENTUM * np.array(first)
+    assert np.allclose(np.array(state["running"]), expected)
+
+
+def test_apg_without_momentum_is_stateless():
+    """The non-CFG path passes no state and must stay a pure function."""
+    from as15.mlx.sampler import _mlx_apg_forward
+
+    cond = mx.array([[[1.0, 2.0], [3.0, 4.0]]])
+    uncond = mx.array([[[0.5, 0.0], [1.0, 2.0]]])
+    a = _mlx_apg_forward(cond, uncond, 7.0, None)
+    b = _mlx_apg_forward(cond, uncond, 7.0, None)
+    assert np.array_equal(np.array(a), np.array(b))
+
+
 # --- weight conversion layout -------------------------------------------
 
 

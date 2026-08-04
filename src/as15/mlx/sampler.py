@@ -41,6 +41,12 @@ class DiffusionResult(TypedDict):
 
 VALID_SAMPLER_MODES = {"euler", "heun"}
 
+# Momentum coefficient of the APG running average, from the default of
+# upstream's ``MomentumBuffer`` (apg_guidance.py). Negative: each step
+# subtracts three quarters of the previous guidance difference rather than
+# accumulating it.
+APG_MOMENTUM = -0.75
+
 # Pre-defined timestep schedules (from modeling_acestep_v15_turbo.py)
 VALID_SHIFTS = [1.0, 2.0, 3.0]
 
@@ -168,7 +174,7 @@ def _mlx_apg_forward(
 
     diff = pred_cond - pred_uncond
     if momentum_state is not None:
-        diff = diff + momentum_state.get("running", 0)
+        diff = diff + APG_MOMENTUM * momentum_state.get("running", 0)
         momentum_state["running"] = diff
 
     if norm_threshold > 0:
