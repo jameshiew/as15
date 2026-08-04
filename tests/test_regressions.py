@@ -1327,6 +1327,115 @@ def test_no_identity_component_can_escape_the_cache_root(monkeypatch, tmp_path):
     assert convert._path_safe("") == "unknown"
 
 
+# --- converter fingerprints ----------------------------------------------
+#
+# The cache is keyed on a converter version that a human has to remember to
+# bump, and forgetting is the one failure the cache cannot catch: a stale file
+# still loads, and a DiT in a layout the MLX model half-understands generates
+# degraded audio rather than raising. So the code that decides what goes in
+# the cache is fingerprinted here, and an edit to it fails the suite.
+#
+# Add a row per version; do not edit one in place unless the output really is
+# unchanged (a rename, a comment moved into code), and say so in the commit.
+CONVERTER_DIGESTS = {
+    ("dit", 1): "1bacd5368711b479",
+    ("vae", 1): "485e8044cc390bb1",
+}
+
+
+def _layout_digest(*functions) -> str:
+    """Digest what *functions* do, ignoring how they are presented.
+
+    Through the AST, so a comment, a reworded docstring or a reflow does not
+    fire the gate, and ``ast.dump`` omits positions by default, so neither
+    does moving a function within the file. Names are kept: a renamed weight
+    key is exactly the change this is here to catch, and a renamed local is
+    cheap enough to re-fingerprint.
+    """
+    import ast
+    import hashlib
+    import inspect
+    import textwrap
+
+    chunks = []
+    for function in functions:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+        for node in ast.walk(tree):
+            body = getattr(node, "body", None)
+            if not isinstance(body, list) or not body:
+                continue
+            first = body[0]
+            if (
+                isinstance(first, ast.Expr)
+                and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)
+            ):
+                node.body = body[1:] or [ast.Pass()]  # ty: ignore[unresolved-attribute]
+        chunks.append(ast.dump(tree))
+    return hashlib.blake2b("\n".join(chunks).encode(), digest_size=8).hexdigest()
+
+
+_BUMP = (
+    "The {asset} converter's output changed. Bump {const} in src/as15/convert.py "
+    "and add ({asset!r}, <new version>): {digest!r} to CONVERTER_DIGESTS, so that "
+    "weights already converted by the old one are orphaned rather than loaded "
+    "into a model that no longer agrees with them. If the output is provably "
+    "unchanged, update the existing row instead and say why in the commit."
+)
+
+
+def test_the_dit_converter_cannot_change_layout_without_a_version_bump():
+    digest = _layout_digest(
+        convert._convert_dit_key,
+        convert._apply_layout,
+        convert._convert_dit_shard,
+    )
+    assert digest == CONVERTER_DIGESTS[("dit", convert.DIT_CONVERTER_VERSION)], (
+        _BUMP.format(asset="dit", const="DIT_CONVERTER_VERSION", digest=digest)
+    )
+
+
+def test_the_vae_converter_cannot_change_layout_without_a_version_bump():
+    digest = _layout_digest(convert._fuse_weight_norm, convert._convert_vae_weights)
+    assert digest == CONVERTER_DIGESTS[("vae", convert.VAE_CONVERTER_VERSION)], (
+        _BUMP.format(asset="vae", const="VAE_CONVERTER_VERSION", digest=digest)
+    )
+
+
+# The same conversion, documented two ways. A gate that fires on prose is one
+# people learn to re-fingerprint without reading the diff, which is the same
+# as not having it.
+def _documented_one_way():
+    def convert(value, layout):
+        """Permute a checkpoint tensor into MLX layout."""
+        return mx.swapaxes(value, 1, 2)
+
+    return convert
+
+
+def _documented_another_way():
+    def convert(value, layout):
+        """PyTorch Conv1d [out, in, K] -> MLX [out, K, in].
+
+        Reworded entirely, and with a comment the other one does not have.
+        """
+        # The axes, not the values.
+        return mx.swapaxes(value, 1, 2)
+
+    return convert
+
+
+def test_the_fingerprint_fires_on_a_changed_permutation_and_not_on_prose():
+    """A gate is only worth having if it catches the mistake it is for."""
+
+    def transposed_the_other_way(value, layout):
+        return mx.swapaxes(value, 0, 1)
+
+    one_way = _documented_one_way()
+    assert _layout_digest(one_way) != _layout_digest(transposed_the_other_way)
+    assert _layout_digest(one_way) == _layout_digest(_documented_another_way())
+
+
 def _dit_manifest(snapshot: Snapshot, precision: str = "bf16") -> dict:
     return {
         "asset": "dit",

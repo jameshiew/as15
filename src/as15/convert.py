@@ -59,6 +59,10 @@ NULL_COND_KEY = "null_condition_emb"
 # than silently loading weights the current MLX models cannot interpret. The
 # two converters version independently: the DiT cache is ~8.3 GB and there is
 # no reason to rebuild it when only the 337 MB VAE conversion changes.
+#
+# Remembering to bump it is the whole of the protection, so it is not left to
+# memory: the converters are fingerprinted in tests/test_regressions.py, which
+# fails on an unaccompanied edit to either of them.
 DIT_CONVERTER_VERSION = 1
 VAE_CONVERTER_VERSION = 1
 
@@ -226,6 +230,30 @@ def dit_cache_path(repo_id: str, revision: str, precision: str) -> Path:
     )
 
 
+def _convert_dit_shard(
+    source: Mapping[str, mx.array], dtype: mx.Dtype
+) -> dict[str, mx.array]:
+    """Map one checkpoint shard onto the subset the MLX DiT loads.
+
+    Split out from :func:`convert_dit` because this, with the two functions
+    above, is the whole of what ends up in the cache -- the rest of that
+    function is where the file goes and who is allowed to write it. Keeping
+    the two apart is what lets ``test_the_dit_converter_cannot_change_layout``
+    fire on a change of output and stay quiet on a change of plumbing.
+    """
+    out: dict[str, mx.array] = {}
+    for key, value in source.items():
+        if key == NULL_COND_KEY:
+            out[NULL_COND_KEY] = value.astype(dtype)
+            continue
+        mapped = _convert_dit_key(key)
+        if mapped is None:
+            continue
+        new_key, layout = mapped
+        out[new_key] = _apply_layout(value, layout).astype(dtype)
+    return out
+
+
 def convert_dit(
     snapshot: Snapshot,
     precision: str = "bf16",
@@ -260,15 +288,7 @@ def convert_dit(
         shards = _shard_files(snapshot.path)
         for shard in tqdm(shards, desc=f"Converting DiT -> {precision}", unit="shard"):
             source = mx.load(str(shard))
-            for key, value in source.items():
-                if key == NULL_COND_KEY:
-                    weights[NULL_COND_KEY] = value.astype(dtype)
-                    continue
-                mapped = _convert_dit_key(key)
-                if mapped is None:
-                    continue
-                new_key, layout = mapped
-                weights[new_key] = _apply_layout(value, layout).astype(dtype)
+            weights.update(_convert_dit_shard(source, dtype))
             # Materialise this shard's conversions before dropping the source
             # dict, so the fp32 buffers are released before the next shard is
             # opened.
@@ -314,6 +334,33 @@ def vae_cache_path(repo_id: str, revision: str) -> Path:
     )
 
 
+def _convert_vae_weights(source: Mapping[str, mx.array]) -> dict[str, mx.array]:
+    """Fuse and re-layout every VAE tensor. See :func:`_convert_dit_shard`."""
+    weights: dict[str, mx.array] = {}
+    for key in tqdm(sorted(source), desc="Converting VAE", unit="tensor"):
+        if key.endswith(".weight_v"):
+            continue  # consumed with its .weight_g partner
+        if key.endswith(".weight_g"):
+            stem = key[: -len(".weight_g")]
+            v_key = stem + ".weight_v"
+            if v_key not in source:
+                raise RuntimeError(f"{key} has no matching {v_key}")
+            w = _fuse_weight_norm(source[key], source[v_key])
+            # conv_t1 is the only ConvTranspose1d in this model.
+            w = (
+                mx.transpose(w, (1, 2, 0))
+                if "conv_t1" in stem
+                else mx.swapaxes(w, 1, 2)
+            )
+            weights[stem + ".weight"] = w
+        elif key.endswith((".alpha", ".beta")):
+            # Snake1d params: [1, C, 1] -> [C]
+            weights[key] = source[key].astype(mx.float32).squeeze()
+        else:
+            weights[key] = source[key].astype(mx.float32)
+    return weights
+
+
 def convert_vae(base: Snapshot, force: bool = False) -> Path:
     """Fuse weight-norm and re-layout the Oobleck VAE for MLX.
 
@@ -336,30 +383,7 @@ def convert_vae(base: Snapshot, force: bool = False) -> Path:
 
         vae_dir = base.path / "vae"
         source = mx.load(str(vae_dir / "diffusion_pytorch_model.safetensors"))
-        weights: dict[str, mx.array] = {}
-        for key in tqdm(sorted(source), desc="Converting VAE", unit="tensor"):
-            if key.endswith(".weight_v"):
-                continue  # consumed with its .weight_g partner
-            if key.endswith(".weight_g"):
-                # Not `base`: that is the Snapshot, and the loop now runs
-                # inside a block that still needs it.
-                stem = key[: -len(".weight_g")]
-                v_key = stem + ".weight_v"
-                if v_key not in source:
-                    raise RuntimeError(f"{key} has no matching {v_key}")
-                w = _fuse_weight_norm(source[key], source[v_key])
-                # conv_t1 is the only ConvTranspose1d in this model.
-                w = (
-                    mx.transpose(w, (1, 2, 0))
-                    if "conv_t1" in stem
-                    else mx.swapaxes(w, 1, 2)
-                )
-                weights[stem + ".weight"] = w
-            elif key.endswith((".alpha", ".beta")):
-                # Snake1d params: [1, C, 1] -> [C]
-                weights[key] = source[key].astype(mx.float32).squeeze()
-            else:
-                weights[key] = source[key].astype(mx.float32)
+        weights = _convert_vae_weights(source)
         mx.eval(list(weights.values()))
 
         _write_cache(weights, out, manifest)
