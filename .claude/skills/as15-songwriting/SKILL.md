@@ -216,11 +216,10 @@ whole workflow: iterate on turbo, render on sft.
 - `--sampler heun` evaluates the model twice per step for a second-order step --
   roughly double the diffusion time. Most worthwhile on 8-step turbo, where the
   step count is small enough that accuracy per step matters.
-- **`--dcw` / `--no-dcw`: leave alone.** The defaults are per-checkpoint for a
-  reason -- DCW on a non-distilled checkpoint is the cause of the garbled-audio
-  reports (https://github.com/ace-step/ACE-Step-1.5/issues/1259, upstream's
-  tracker, not this repo's). Only touch it if you are explicitly experimenting
-  with that.
+- **`--dcw` / `--no-dcw`: leave alone.** as15 already follows the checkpoint --
+  off for `xl-sft`, on for `xl-turbo`. Wavelet-domain correction was tuned for
+  the distilled models, and forcing it on a non-distilled one makes output mushy
+  and distorted. The override is there for experiments, not for tuning a take.
 - `--precision`: `bf16`. `fp32` doubles memory for no measurable gain.
 
 ---
