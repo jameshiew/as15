@@ -25,7 +25,14 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .models import LATENT_FPS
+from .models import LATENT_FPS, shard_files
+
+# The CFG null branch's condition embedding, stored at the top level of the DiT
+# checkpoint. Read here and nowhere else: the converter used to copy it into
+# the MLX cache as well, where nothing ever read it -- the loader popped it
+# straight back out -- so the cache carried a second, bf16-rounded copy of a
+# tensor whose only consumer takes the fp32 original.
+NULL_COND_KEY = "null_condition_emb"
 
 # Verbatim from acestep.constants -- these strings are part of the trained
 # prompt format, so they must not be paraphrased.
@@ -319,39 +326,45 @@ def _to_numpy(t: torch.Tensor) -> np.ndarray:
 
 
 def _load_encoder_state_dict(snapshot: Path, dtype: torch.dtype) -> dict:
-    """Read only the ``encoder.*`` tensors out of the checkpoint shards."""
+    """Read only the ``encoder.*`` tensors out of the checkpoint shards.
+
+    Every shard is opened rather than only the ones the index lists encoder
+    weights in. ``safe_open`` reads a header, and ``keys()`` no tensor data,
+    so the shortcut saved nothing worth keeping a second copy of the shard
+    layout for -- and that copy was the one that handled both layouts.
+    """
     from safetensors.torch import safe_open
 
-    index = snapshot / "model.safetensors.index.json"
-    if index.exists():
-        weight_map = json.loads(index.read_text())["weight_map"]
-        wanted: dict[str, list[str]] = {}
-        for key, shard in weight_map.items():
-            if key.startswith("encoder."):
-                wanted.setdefault(shard, []).append(key)
-    else:
-        wanted = {"model.safetensors": None}
-
     state: dict[str, torch.Tensor] = {}
-    for shard, keys in wanted.items():
-        with safe_open(snapshot / shard, framework="pt") as f:
-            for key in keys if keys is not None else f.keys():
-                if not key.startswith("encoder."):
-                    continue
-                state[key[len("encoder.") :]] = f.get_tensor(key).to(dtype)
+    for shard in shard_files(snapshot):
+        with safe_open(shard, framework="pt") as f:
+            for key in sorted(f.keys()):
+                if key.startswith("encoder."):
+                    state[key[len("encoder.") :]] = f.get_tensor(key).to(dtype)
     if not state:
         raise RuntimeError(f"No encoder.* weights found in {snapshot}")
     return state
 
 
 def _load_null_condition_emb(snapshot: Path) -> np.ndarray:
-    """Read the CFG null-condition embedding from the converted MLX cache."""
+    """Read the CFG null-condition embedding out of the DiT checkpoint.
+
+    The checkpoint is the only place it can come from: conditioning runs
+    before the DiT is loaded, which on a cold cache is before the conversion
+    has happened at all. Reading the fp32 original also keeps CFG clear of
+    whatever precision the DiT was converted at.
+
+    Every shard is opened until the key turns up, rather than looked up in an
+    index that a single-file checkpoint does not have. ``mx.load`` is lazy, so
+    that costs a header read per shard: pulling one ``[1, 1, D]`` tensor out
+    of a 1 GB shard measures at 0.000 s and no MLX allocation at all.
+    """
     import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 
-    from .convert import NULL_COND_KEY
-
-    index = snapshot / "model.safetensors.index.json"
-    weight_map = json.loads(index.read_text())["weight_map"]
-    shard = weight_map[NULL_COND_KEY]
-    value = mx.load(str(snapshot / shard))[NULL_COND_KEY]
-    return np.array(value.astype(mx.float32))
+    for shard in shard_files(snapshot):
+        weights = mx.load(str(shard))
+        if NULL_COND_KEY in weights:
+            return np.array(weights[NULL_COND_KEY].astype(mx.float32))
+    raise RuntimeError(
+        f"{NULL_COND_KEY!r} missing from {snapshot}; CFG cannot be built."
+    )

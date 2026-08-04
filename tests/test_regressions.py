@@ -1249,6 +1249,94 @@ def test_dit_key_mapping_unwraps_sequential_and_drops_rope():
     assert convert._convert_dit_key("tokenizer.quantizer.weight") is None
 
 
+def test_the_dit_cache_holds_only_what_the_model_loads(tmp_path):
+    """The converter used to also copy in the CFG null embedding.
+
+    Nothing read it there. The DiT has no parameter by that name, so the
+    loader popped it back out first -- and a pop is indiscriminate, so it
+    would equally have hidden a key the converter emitted by mistake from
+    ``load_weights``, which is otherwise strict about exactly this. The null
+    embedding is read from the checkpoint instead, where CFG needs it before
+    the conversion has necessarily happened at all.
+    """
+    source = {
+        conditioning.NULL_COND_KEY: mx.zeros((1, 1, 4)),
+        "decoder.layers.0.mlp.up_proj.weight": mx.zeros((2, 3)),
+        "decoder.layers.0.self_attn.rotary_emb.inv_freq": mx.zeros((4,)),
+        "encoder.lyric_encoder.layers.0.mlp.up_proj.weight": mx.zeros((2, 3)),
+        "tokenizer.quantizer.weight": mx.zeros((2, 2)),
+    }
+    converted = convert._convert_dit_shard(source, mx.bfloat16)
+    assert set(converted) == {"layers.0.mlp.up_proj.weight"}
+
+
+def _write_checkpoint(directory: Path, shards: dict[str, dict]) -> Path:
+    """Write a checkpoint of *shards*, indexed only if there is more than one.
+
+    Which is how the real ones are published: a sharded checkpoint carries
+    ``model.safetensors.index.json``, a small one is a bare
+    ``model.safetensors`` with no index at all.
+    """
+    directory.mkdir(parents=True)
+    for name, weights in shards.items():
+        mx.save_safetensors(str(directory / name), weights)
+    if len(shards) > 1:
+        weight_map = {key: name for name, w in shards.items() for key in w}
+        (directory / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": weight_map})
+        )
+    return directory
+
+
+def test_the_null_embedding_is_read_from_whichever_shard_holds_it(tmp_path):
+    """It used to be looked up through the index, and only through the index.
+
+    Every other reader falls back to a single ``model.safetensors``, so a
+    checkpoint published without an index loaded everywhere except here,
+    which died on an index file that checkpoint never had.
+    """
+    sharded = _write_checkpoint(
+        tmp_path / "sharded",
+        {
+            "a.safetensors": {"decoder.layers.0.weight": mx.zeros((2, 2))},
+            "b.safetensors": {conditioning.NULL_COND_KEY: mx.full((1, 1, 4), 0.5)},
+        },
+    )
+    single = _write_checkpoint(
+        tmp_path / "single",
+        {
+            "model.safetensors": {
+                "decoder.layers.0.weight": mx.zeros((2, 2)),
+                conditioning.NULL_COND_KEY: mx.full((1, 1, 4), 0.5),
+            }
+        },
+    )
+    assert models.shard_files(single) == [single / "model.safetensors"]
+
+    for snapshot in (sharded, single):
+        emb = conditioning._load_null_condition_emb(snapshot)
+        # fp32 from the checkpoint, not the bf16 the converter would have cast
+        # it to: CFG is one branch of the sampler and does not want rounding
+        # the DiT's own precision imposed on it.
+        assert emb.dtype == np.float32
+        assert emb.shape == (1, 1, 4)
+        assert np.allclose(emb, 0.5)
+
+
+def test_a_checkpoint_that_cannot_do_cfg_says_which_tensor_is_missing(tmp_path):
+    snapshot = _write_checkpoint(
+        tmp_path / "no-null",
+        {"model.safetensors": {"decoder.layers.0.weight": mx.zeros((2, 2))}},
+    )
+    with pytest.raises(RuntimeError, match="CFG cannot be built"):
+        conditioning._load_null_condition_emb(snapshot)
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(FileNotFoundError, match="No safetensors weights"):
+        models.shard_files(empty)
+
+
 def test_weight_norm_fusion_matches_definition():
     g = mx.array(np.array([[[2.0]], [[3.0]]], dtype=np.float32))
     v = mx.random.normal((2, 4, 3), key=mx.random.key(0))
@@ -1339,6 +1427,7 @@ def test_no_identity_component_can_escape_the_cache_root(monkeypatch, tmp_path):
 # unchanged (a rename, a comment moved into code), and say so in the commit.
 CONVERTER_DIGESTS = {
     ("dit", 1): "1bacd5368711b479",
+    ("dit", 2): "84c5bcb0a6657909",  # stopped copying null_condition_emb in
     ("vae", 1): "485e8044cc390bb1",
 }
 

@@ -138,6 +138,25 @@ def ensure_snapshot(
     return Snapshot(repo_id=repo_id, revision=path.name or revision, path=path)
 
 
+def shard_files(snapshot: Path) -> list[Path]:
+    """Return the safetensors shards of a checkpoint, in index order.
+
+    Small checkpoints ship a single ``model.safetensors`` with no index, so
+    both layouts are handled here rather than in each reader -- one of them
+    used to assume the index and raised FileNotFoundError on a checkpoint the
+    others loaded fine.
+    """
+    index = snapshot / "model.safetensors.index.json"
+    if index.exists():
+        weight_map = json.loads(index.read_text())["weight_map"]
+        names = sorted(set(weight_map.values()))
+        return [snapshot / n for n in names]
+    single = snapshot / "model.safetensors"
+    if single.exists():
+        return [single]
+    raise FileNotFoundError(f"No safetensors weights found in {snapshot}")
+
+
 def load_dit_config(snapshot: Path) -> SimpleNamespace:
     """Load a DiT ``config.json`` as a plain attribute bag.
 

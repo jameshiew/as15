@@ -13,7 +13,7 @@ import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 import numpy as np
 
 from .atomic import publish
-from .convert import NULL_COND_KEY, convert_dit, convert_vae, resolve_precision
+from .convert import convert_dit, convert_vae, resolve_precision
 from .mlx.sampler import check_guidance, check_sampling_options
 from .models import (
     BASE_REPO,
@@ -255,8 +255,10 @@ def _load_dit(dit_snapshot: Snapshot, precision: str):
 
     path = convert_dit(dit_snapshot, precision)
     config = load_dit_config(dit_snapshot.path)
+    # Every key in the cache is one the model has: load_weights is strict, and
+    # the pop that used to make that true hid whatever else the converter had
+    # put there. Conditioning reads the null embedding from the checkpoint.
     weights = mx.load(str(path))
-    weights.pop(NULL_COND_KEY, None)
     dit = MLXDiTDecoder.from_config(config)
     dit.load_weights(list(weights.items()))
     mx.eval(dit.parameters())

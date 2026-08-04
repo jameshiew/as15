@@ -26,7 +26,7 @@ import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 from tqdm import tqdm
 
 from .atomic import publish
-from .models import Snapshot, cache_root
+from .models import Snapshot, cache_root, shard_files
 
 # Precision labels, mapped to the ``mlx.core`` dtype name they select. Names
 # rather than dtype objects: the sampler takes its compute dtype as a string
@@ -50,9 +50,6 @@ def resolve_precision(precision: str) -> str:
         ) from None
 
 
-# Emitted alongside the DiT weights; needed to build the CFG null branch.
-NULL_COND_KEY = "null_condition_emb"
-
 # Bump when a converter's output stops matching what the previous version
 # wrote -- renamed keys, a changed axis permutation, a different dtype policy.
 # The version is part of the cache path, so a bump orphans the old file rather
@@ -63,21 +60,8 @@ NULL_COND_KEY = "null_condition_emb"
 # Remembering to bump it is the whole of the protection, so it is not left to
 # memory: the converters are fingerprinted in tests/test_regressions.py, which
 # fails on an unaccompanied edit to either of them.
-DIT_CONVERTER_VERSION = 1
+DIT_CONVERTER_VERSION = 2
 VAE_CONVERTER_VERSION = 1
-
-
-def _shard_files(snapshot: Path) -> list[Path]:
-    """Return the safetensors shards of a checkpoint, in index order."""
-    index = snapshot / "model.safetensors.index.json"
-    if index.exists():
-        weight_map = json.loads(index.read_text())["weight_map"]
-        names = sorted(set(weight_map.values()))
-        return [snapshot / n for n in names]
-    single = snapshot / "model.safetensors"
-    if single.exists():
-        return [single]
-    raise FileNotFoundError(f"No safetensors weights found in {snapshot}")
 
 
 def _convert_dit_key(key: str) -> tuple[str, str] | None:
@@ -235,6 +219,10 @@ def _convert_dit_shard(
 ) -> dict[str, mx.array]:
     """Map one checkpoint shard onto the subset the MLX DiT loads.
 
+    That subset is exactly ``decoder.*``, which is what makes the cache
+    loadable with ``load_weights`` as it stands: anything else in here would
+    have to be popped back out before the model would accept it.
+
     Split out from :func:`convert_dit` because this, with the two functions
     above, is the whole of what ends up in the cache -- the rest of that
     function is where the file goes and who is allowed to write it. Keeping
@@ -243,9 +231,6 @@ def _convert_dit_shard(
     """
     out: dict[str, mx.array] = {}
     for key, value in source.items():
-        if key == NULL_COND_KEY:
-            out[NULL_COND_KEY] = value.astype(dtype)
-            continue
         mapped = _convert_dit_key(key)
         if mapped is None:
             continue
@@ -285,7 +270,7 @@ def convert_dit(
             return out
 
         weights: dict[str, mx.array] = {}
-        shards = _shard_files(snapshot.path)
+        shards = shard_files(snapshot.path)
         for shard in tqdm(shards, desc=f"Converting DiT -> {precision}", unit="shard"):
             source = mx.load(str(shard))
             weights.update(_convert_dit_shard(source, dtype))
@@ -296,10 +281,8 @@ def convert_dit(
             del source
             mx.clear_cache()
 
-        if NULL_COND_KEY not in weights:
-            raise RuntimeError(
-                f"{NULL_COND_KEY!r} missing from {snapshot.path}; CFG cannot be built."
-            )
+        if not weights:
+            raise RuntimeError(f"No decoder.* weights found in {snapshot.path}")
 
         _write_cache(weights, out, manifest)
     return out
