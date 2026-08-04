@@ -9,6 +9,7 @@ from __future__ import annotations
 import fcntl
 import itertools
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,7 +17,7 @@ import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 import numpy as np
 import pytest
 
-from as15 import conditioning, convert, models
+from as15 import atomic, conditioning, convert, models, pipeline
 from as15.models import BASE_REPO, BASE_REVISION, MODELS, Snapshot
 
 
@@ -514,6 +515,8 @@ CLI_REJECTS = [
     ["--bpm", "0"],
     ["--time-signature", "5"],
     ["--language", " "],
+    ["--out", "song.mp3"],
+    ["--out", "song"],
 ]
 
 
@@ -560,7 +563,17 @@ def test_the_cli_accepts_the_smallest_valid_step_count(monkeypatch, tmp_path):
 
     result = CliRunner().invoke(
         cli.app,
-        ["sing", "-p", "x", "--steps", "1", "--shift", "2", "-o", str(tmp_path / "a")],
+        [
+            "sing",
+            "-p",
+            "x",
+            "--steps",
+            "1",
+            "--shift",
+            "2",
+            "-o",
+            str(tmp_path / "a.flac"),
+        ],
     )
 
     assert result.exit_code == 0, result.output
@@ -811,6 +824,165 @@ def test_a_stage_hands_its_memory_back_when_it_fails(monkeypatch, fail_in, clean
         _run_with_stub_stages(monkeypatch, log, fail_in=fail_in)
 
     assert log[-2:] == [fail_in, cleanup]
+
+
+# --- writing the output ---------------------------------------------------
+#
+# Everything a generation is for arrives in the last two seconds of a run that
+# took minutes, so the questions "can this be written?" and "is this worth
+# writing?" are asked before and around the write rather than left to
+# whatever soundfile does with a bad argument.
+
+
+def _tone(seconds: float = 0.05, channels: int = 2) -> np.ndarray:
+    """A short sine, so a round trip has something to compare."""
+    t = np.arange(int(seconds * models.SAMPLE_RATE)) / models.SAMPLE_RATE
+    wave = 0.5 * np.sin(2 * np.pi * 440.0 * t, dtype=np.float32)
+    return np.repeat(wave[:, None], channels, axis=1)
+
+
+@pytest.mark.parametrize("name", ["song.mp3", "song.wav", "song", "song.flac.bak"])
+def test_a_container_that_is_not_written_is_rejected(name, tmp_path):
+    """soundfile takes the format from the extension and writes ~27 of them.
+
+    Only one is a good answer for a lossless 48 kHz master, so the others are
+    a typo rather than a request -- and a typo used to be discovered by
+    soundfile, after the generation.
+    """
+    with pytest.raises(ValueError, match="extension"):
+        pipeline.check_output_path(tmp_path / name)
+
+
+def test_the_extension_is_matched_case_insensitively(tmp_path):
+    pipeline.check_output_path(tmp_path / "SONG.FLAC")
+
+
+def test_a_directory_is_not_something_to_write_a_song_over(tmp_path):
+    target = tmp_path / "song.flac"
+    target.mkdir()
+    with pytest.raises(ValueError, match="directory"):
+        pipeline.check_output_path(target)
+
+
+def test_an_output_directory_that_does_not_exist_yet_is_allowed(tmp_path):
+    """write_audio creates it -- and the preflight leaves it to write_audio.
+
+    A preflight that created directories itself would litter one per failed
+    generation, which is every run that dies in conditioning or diffusion.
+    """
+    pipeline.check_output_path(tmp_path / "takes" / "tuesday" / "song.flac")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_file_where_the_output_directory_should_be_is_rejected(tmp_path):
+    (tmp_path / "takes").write_text("not a directory")
+    with pytest.raises(ValueError, match="is a file"):
+        pipeline.check_output_path(tmp_path / "takes" / "song.flac")
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root may write anywhere")
+def test_a_directory_that_cannot_be_written_to_is_rejected(tmp_path):
+    """Permission is asked of the directory, which is what the rename needs."""
+    locked = tmp_path / "locked"
+    locked.mkdir(mode=0o500)
+    try:
+        with pytest.raises(ValueError, match="not writable"):
+            pipeline.check_output_path(locked / "song.flac")
+    finally:
+        locked.chmod(0o700)
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
+def test_audio_that_is_not_finite_is_refused_rather_than_laundered(bad, tmp_path):
+    """The peak limiter turns both into a plausible-looking file.
+
+    A NaN fails ``peak > 0.999`` and is written through untouched; an
+    infinity makes the scale factor 0.999/inf == 0, which multiplies the
+    whole track down to zeros and NaNs. Both produce a file that plays.
+    """
+    audio = _tone()
+    audio[7, 0] = bad
+    with pytest.raises(ValueError, match="NaN or infinite"):
+        pipeline.write_audio(tmp_path / "song.flac", audio, models.SAMPLE_RATE)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_the_written_file_reads_back_as_what_was_generated(tmp_path):
+    """Positive control: the checks above must not have broken the write."""
+    import soundfile as sf
+
+    audio = _tone()
+    out = tmp_path / "takes" / "song.flac"
+    pipeline.write_audio(out, audio, models.SAMPLE_RATE)
+
+    read, rate = sf.read(str(out), dtype="float32", always_2d=True)
+    assert rate == models.SAMPLE_RATE
+    assert read.shape == audio.shape
+    # The container is 16-bit, so a sample can move by half a step and no more.
+    assert np.abs(read - audio).max() <= 2**-15
+
+
+def test_a_failed_write_leaves_the_previous_take_intact(monkeypatch, tmp_path):
+    """The write used to encode straight into the destination.
+
+    A full disk, a crash or a ^C part way through therefore destroyed
+    whatever was already there and left a truncated file in its place --
+    with the generation that would have replaced it gone too.
+    """
+    import soundfile as sf
+
+    out = tmp_path / "song.flac"
+    pipeline.write_audio(out, _tone(), models.SAMPLE_RATE)
+    before = out.read_bytes()
+
+    def die(path, *args, **kwargs):
+        Path(path).write_bytes(b"half a song")
+        raise RuntimeError("no space left on device")
+
+    monkeypatch.setattr(sf, "write", die)
+    with pytest.raises(RuntimeError):
+        pipeline.write_audio(out, _tone(), models.SAMPLE_RATE)
+
+    assert out.read_bytes() == before
+    assert [p.name for p in tmp_path.iterdir()] == ["song.flac"]
+
+
+def test_the_cli_says_it_is_about_to_overwrite_a_take(monkeypatch, tmp_path):
+    """Overwriting is the policy; being told after the fact is not.
+
+    Said before the run rather than after, because after is four minutes too
+    late to move the file that was there.
+    """
+    from typer.testing import CliRunner
+
+    from as15 import cli
+
+    out = tmp_path / "song.flac"
+    out.write_bytes(b"an earlier take")
+    monkeypatch.setattr(
+        cli,
+        "generate",
+        lambda *args, **kwargs: pipeline.GenerationResult(
+            audio=np.zeros((4, 2), dtype=np.float32), sample_rate=48_000, seed=0
+        ),
+    )
+    monkeypatch.setattr(cli, "write_audio", lambda *args: None)
+
+    result = CliRunner().invoke(cli.app, ["sing", "-p", "x", "-o", str(out)])
+
+    assert result.exit_code == 0, result.output
+    assert "will be overwritten" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "shape,label",
+    [((4,), "mono"), ((4, 1), "mono"), ((4, 2), "stereo"), ((4, 6), "6 channels")],
+)
+def test_the_cli_reports_the_channels_it_actually_wrote(shape, label):
+    """This line said "stereo" whatever came back from the VAE."""
+    from as15 import cli
+
+    assert cli._channels(np.zeros(shape, dtype=np.float32)) == label
 
 
 # --- compute dtype -------------------------------------------------------
@@ -1194,8 +1366,8 @@ def test_concurrent_writers_never_share_a_temporary_file(monkeypatch, tmp_path):
         seen.append(tmp)
         tmp.write_bytes(b"")
 
-    convert._publish(out, record)
-    convert._publish(out, record)
+    atomic.publish(out, record)
+    atomic.publish(out, record)
 
     assert seen[0] != seen[1]
     # Same directory, so replace() is a rename and not a copy across devices.
@@ -1218,7 +1390,7 @@ def test_a_failed_write_leaves_neither_a_partial_cache_nor_debris(
         raise RuntimeError("no space left on device")
 
     with pytest.raises(RuntimeError):
-        convert._publish(out, explode)
+        atomic.publish(out, explode)
 
     assert not out.exists()
     assert list(out.parent.iterdir()) == []

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,6 +12,7 @@ from pathlib import Path
 import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 import numpy as np
 
+from .atomic import publish
 from .convert import NULL_COND_KEY, convert_dit, convert_vae, resolve_precision
 from .mlx.sampler import check_guidance, check_sampling_options
 from .models import (
@@ -368,9 +370,78 @@ def generate(
     )
 
 
+# The one container we write. soundfile takes the format from the extension
+# and will write a couple of dozen of them, but the rest were never a choice
+# so much as whatever libsndfile happened to accept: lossy ones throw away
+# what the VAE just spent 8 GB decoding, and the obscure lossless ones (SD2,
+# W64, PVF) answer no question anyone has. FLAC is lossless, half the size of
+# WAV, and reads everywhere.
+OUTPUT_SUFFIX = ".flac"
+OUTPUT_SUBTYPE = "PCM_16"
+
+
+def check_output_path(path: Path) -> None:
+    """Fail now if the finished audio could not be written to *path*.
+
+    Everything here is a property of the path alone, so it can be answered
+    before a note is generated. It used to surface from :func:`write_audio`,
+    which runs after the weights have downloaded, after conditioning and
+    after fifty diffusion steps -- a mistyped extension or an output
+    directory that does not exist cost the whole run.
+
+    Nothing is created: the ``mkdir`` stays in :func:`write_audio`, so a
+    preflight that passes has not left a directory behind for a generation
+    that then fails. Permission is checked on the nearest existing ancestor,
+    which is the one ``mkdir`` needs it on.
+
+    Raises:
+        ValueError: naming what about the path cannot work.
+    """
+    if path.suffix.lower() != OUTPUT_SUFFIX:
+        raise ValueError(
+            f"the output format comes from the extension, and {OUTPUT_SUFFIX} "
+            f"is the only one written; {path.name!r} asks for "
+            f"{path.suffix or 'none'}."
+        )
+    if path.is_dir():
+        raise ValueError(f"{path} is a directory, not the file to write.")
+
+    existing = next(p for p in (path.parent, *path.parent.parents) if p.exists())
+    if not existing.is_dir():
+        raise ValueError(f"{existing} is a file, so {path.parent} cannot be created.")
+    # The write lands on a temporary in this directory and is renamed over the
+    # destination, so what has to be writable is the directory. An existing
+    # read-only file at *path* is replaced fine.
+    if not os.access(existing, os.W_OK):
+        raise ValueError(f"{existing} is not writable.")
+
+
 def write_audio(path: Path, audio: np.ndarray, sample_rate: int) -> None:
-    """Write audio, peak-limiting only if the decode overshot full scale."""
+    """Write audio, peak-limiting only if the decode overshot full scale.
+
+    The file appears whole or not at all: soundfile encodes into a temporary
+    alongside it, which is renamed over *path* once the encoder has closed.
+    A write that ran out of disk, or was interrupted, used to leave a
+    truncated file where the song should be -- having already destroyed the
+    take that was there before.
+
+    :func:`check_output_path` runs first, so what the CLI preflights and what
+    the write accepts are the same rules rather than two copies of them.
+
+    Raises:
+        ValueError: if *path* cannot be written, or the audio is not finite.
+    """
     import soundfile as sf
+
+    check_output_path(path)
+
+    # Checked before the peak-limiting below, which launders both: a NaN fails
+    # `peak > 0.999` and is written through untouched, and an infinity makes
+    # the scale factor 0.999/inf == 0, turning every sample into 0 or NaN.
+    # Either way the result is a file of silence or noise, written as if the
+    # generation had worked.
+    if not np.all(np.isfinite(audio)):
+        raise ValueError("the decode produced samples that are NaN or infinite.")
 
     peak = float(np.max(np.abs(audio))) if audio.size else 0.0
     if peak > 0.999:
@@ -378,8 +449,10 @@ def write_audio(path: Path, audio: np.ndarray, sample_rate: int) -> None:
         audio = audio * (0.999 / peak)
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    subtype = "PCM_16" if path.suffix.lower() in {".wav", ".flac"} else None
-    sf.write(str(path), audio, sample_rate, subtype=subtype)
+    publish(
+        path,
+        lambda tmp: sf.write(str(tmp), audio, sample_rate, subtype=OUTPUT_SUBTYPE),
+    )
 
 
 def latent_frames_for(duration: float) -> int:

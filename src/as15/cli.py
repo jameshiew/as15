@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 import sys
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import typer
 
@@ -14,11 +14,16 @@ from .models import DEFAULT_MODEL, MODELS, ModelSpec, resolve
 from .pipeline import (
     MAX_DURATION,
     MIN_DURATION,
+    OUTPUT_SUFFIX,
     GenerationRequest,
+    check_output_path,
     generate,
     resolve_settings,
     write_audio,
 )
+
+if TYPE_CHECKING:
+    import numpy as np
 
 app = typer.Typer(
     add_completion=False,
@@ -42,6 +47,17 @@ def _resolve_model(name: str) -> ModelSpec:
         return resolve(name)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from None
+
+
+def _channels(audio: np.ndarray) -> str:
+    """How to describe the decoded audio's channel layout.
+
+    Read off the array rather than asserted: this line used to say "stereo"
+    unconditionally, while nothing between the VAE config and here requires
+    the checkpoint to have two output channels.
+    """
+    count = audio.shape[1] if audio.ndim > 1 else 1
+    return {1: "mono", 2: "stereo"}.get(count, f"{count} channels")
 
 
 def _read_lyrics(lyrics: str | None, lyrics_file: Path | None) -> str:
@@ -75,9 +91,10 @@ def sing(
             help="Read lyrics from a file, or '-' for stdin.",
         ),
     ] = None,
-    out: Annotated[Path, typer.Option("--out", "-o", help="Output audio file.")] = Path(
-        "song.flac"
-    ),
+    out: Annotated[
+        Path,
+        typer.Option("--out", "-o", help=f"Output file; must end in {OUTPUT_SUFFIX}."),
+    ] = Path("song.flac"),
     model: Annotated[
         str, typer.Option("--model", "-m", help=f"One of: {', '.join(MODELS)}.")
     ] = DEFAULT_MODEL,
@@ -168,10 +185,21 @@ def sing(
     # The same call generate() makes, so the banner below cannot report
     # settings other than the ones that run -- and so a bad option costs a
     # second rather than the minutes it takes to reach the diffusion loop.
+    # Same for --out: what the write will insist on, asked before the run
+    # rather than after it.
     try:
         settings = resolve_settings(spec, request)
+        check_output_path(out)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from None
+
+    # Overwriting is the policy -- rerunning a command should not need the
+    # last take cleared out of the way first -- but it is said out loud here,
+    # while there is still time to stop, rather than discovered afterwards.
+    if out.exists():
+        typer.secho(
+            f"{out} exists and will be overwritten.", fg=typer.colors.YELLOW, err=True
+        )
 
     if not lyrics_text.strip():
         typer.secho(
@@ -206,12 +234,20 @@ def sing(
         _err(str(exc))
         raise typer.Exit(2) from None
 
-    write_audio(out, result.audio, result.sample_rate)
+    # A generation this far in is worth more than a traceback: an unwritable
+    # destination or a decode that came back non-finite is reported as an
+    # error, having left whatever was at *out* alone.
+    try:
+        write_audio(out, result.audio, result.sample_rate)
+    except (ValueError, OSError) as exc:
+        _err(f"Could not write {out}: {exc}")
+        raise typer.Exit(1) from None
 
     t = result.timings
     seconds = len(result.audio) / result.sample_rate
     typer.secho(
-        f"\nwrote {out}  ({seconds:.1f}s audio, {result.sample_rate} Hz stereo)",
+        f"\nwrote {out}  ({seconds:.1f}s audio, {result.sample_rate} Hz "
+        f"{_channels(result.audio)})",
         fg=typer.colors.GREEN,
         err=True,
     )

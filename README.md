@@ -81,11 +81,19 @@ the instruction and metadata lines it is wrapped in, ~54 of them) and **2048** f
 the lyrics. Over that is rejected, saying how much to cut — upstream truncates
 instead, which returns a song missing its last verses and does not mention it.
 
+Output is FLAC, 16-bit, 48 kHz, and `-o` has to name one: it is the only container
+worth writing a lossless master into, and picking the format from a typo'd
+extension is not a feature. The path is checked before the run rather than after
+it, an existing file is overwritten (you are told first), and the write lands on a
+temporary that is renamed into place, so an interrupted one cannot leave you with
+neither the new take nor the old.
+
 Useful options:
 
 | Flag | Default | Notes |
 | --- | --- | --- |
 | `-m, --model` | `xl-sft` | `xl-sft` (best) or `xl-turbo` (~6x faster) |
+| `-o, --out` | `song.flac` | Must end in `.flac` |
 | `-d, --duration` | `120` | Seconds, 10–600 |
 | `-s, --steps` | model default | 50 for sft, 8 for turbo |
 | `-g, --guidance` | `7.0` | CFG scale, 1.0 or above; 1.0 turns CFG off. Ignored by turbo, which is distilled |

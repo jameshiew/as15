@@ -16,14 +16,14 @@ from __future__ import annotations
 
 import fcntl
 import json
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from uuid import uuid4
 
 import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 from tqdm import tqdm
 
+from .atomic import publish
 from .models import Snapshot, cache_root
 
 # Precision labels, mapped to the ``mlx.core`` dtype name they select. Names
@@ -167,24 +167,6 @@ def _cache_lock(target: Path) -> Iterator[None]:
     # unlinking it would let a waiter lock a path nobody else can see.
 
 
-def _publish(target: Path, write: Callable[[Path], object]) -> None:
-    """Install whatever *write* produces at *target*, atomically.
-
-    The temporary lives in the destination directory so ``replace`` is a
-    same-filesystem rename, and carries a random component so a writer that
-    somehow skipped :func:`_cache_lock` cannot rename another writer's
-    half-finished file into place. It keeps *target*'s extension:
-    ``mx.save_safetensors`` dispatches on it and fails with a bare
-    ``FileNotFoundError`` on any other name.
-    """
-    tmp = target.with_name(f"{target.stem}.{uuid4().hex[:8]}.tmp{target.suffix}")
-    try:
-        write(tmp)
-        tmp.replace(target)
-    finally:
-        tmp.unlink(missing_ok=True)
-
-
 def _write_cache(
     weights: dict[str, mx.array], out: Path, manifest: Mapping[str, object]
 ) -> None:
@@ -195,8 +177,8 @@ def _write_cache(
     reconversion. The reverse order would hand it a manifest vouching for
     weights that are not there yet.
     """
-    _publish(out, lambda tmp: mx.save_safetensors(str(tmp), weights))
-    _publish(
+    publish(out, lambda tmp: mx.save_safetensors(str(tmp), weights))
+    publish(
         _manifest_path(out),
         lambda tmp: tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True)),
     )
