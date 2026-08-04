@@ -17,7 +17,7 @@ import pytest
 
 from as15 import conditioning, models, pipeline
 from as15.models import MODELS, Snapshot
-from helpers import request
+from helpers import flac_comments, request
 
 # --- resolving a request --------------------------------------------------
 
@@ -387,6 +387,118 @@ def test_the_channel_count_is_whatever_the_decode_produced(channels, tmp_path):
 
     read, _ = sf.read(str(out), dtype="float32", always_2d=True)
     assert read.shape == (audio.shape[0], channels)
+
+
+# --- what the file says it is ---------------------------------------------
+#
+# The prompt, the lyrics and the seed exist only in the shell history that
+# produced a take, which is to say until the next reboot. These put them in the
+# file. ``as15.flac`` covers the block itself; what is checked here is that the
+# recipe recorded is the one that ran.
+
+
+def _tags(spec, **kwargs) -> dict[str, str]:
+    req = request(**kwargs)
+    return pipeline.describe(spec, req, pipeline.resolve_settings(spec, req))
+
+
+def test_the_tags_record_the_settings_that_ran_not_the_ones_asked_for():
+    """Same argument as the banner: a request's ``None`` describes no run.
+
+    A take generated with the checkpoint's defaults would otherwise record
+    nothing about steps or shift, and a turbo take asked for CFG would record
+    a guidance the sampler never used.
+    """
+    tags = _tags(MODELS["xl-turbo"], guidance=7.0, seed=99)
+
+    assert tags["AS15_STEPS"] == "8"  # xl-turbo's default, not the request's None
+    assert tags["AS15_SHIFT"] == "3"
+    assert tags["AS15_DCW"] == "on"
+    assert tags["AS15_GUIDANCE"] == "1"  # distilled: CFG was dropped
+    assert tags["AS15_SEED"] == "99"
+
+
+def test_the_tags_name_the_commit_the_weights_came_from():
+    """Upstream force-pushes under the same repo ID, so the ID is not an answer."""
+    spec = MODELS["xl-sft"]
+    assert _tags(spec)["AS15_CHECKPOINT"] == f"{spec.repo_id}@{spec.revision}"
+
+
+def test_an_instrumental_carries_no_lyrics_field():
+    """Absent and empty are different claims; players render the second blank."""
+    spec = MODELS["xl-sft"]
+    assert "LYRICS" not in _tags(spec)
+
+    req = pipeline.GenerationRequest(style_prompt="a song", lyrics="[verse]\nOh")
+    tags = pipeline.describe(spec, req, pipeline.resolve_settings(spec, req))
+    assert tags["LYRICS"] == "[verse]\nOh"
+
+
+def test_an_unseeded_draw_does_not_claim_a_seed():
+    """The CLI always picks one; a caller building the request may not.
+
+    Writing a seed there would offer a reproduction that does not reproduce.
+    """
+    assert "AS15_SEED" not in _tags(MODELS["xl-sft"])
+
+
+def test_conditioning_metas_are_recorded_only_when_they_were_given():
+    """The model is told "N/A" for an unset one, which is not a value to record."""
+    assert "AS15_BPM" not in _tags(MODELS["xl-sft"])
+
+    tags = _tags(MODELS["xl-sft"], bpm=128, key_scale="C minor", time_signature=3)
+    assert tags["AS15_BPM"] == "128"
+    assert tags["AS15_KEY"] == "C minor"
+    assert tags["AS15_TIME_SIGNATURE"] == "3"
+
+
+def test_every_tag_name_is_one_the_container_can_carry():
+    """describe() names the fields, and flac.py is the only thing checking them.
+
+    A name with an ``=`` or a non-ASCII character in it would fail the write
+    at the end of a generation rather than here.
+    """
+    from as15 import flac
+
+    tags = _tags(MODELS["xl-sft"], bpm=128, key_scale="C minor", time_signature=3)
+    for name in tags:
+        flac.check_field_name(name)
+
+
+def test_the_tags_do_not_move_between_two_runs_of_the_same_request():
+    """No clock, no host, no run counter.
+
+    Regenerating at a fixed seed and diffing the file against the previous
+    build is how a change is shown not to have moved the audio; a timestamp in
+    the metadata would make every such diff non-empty.
+    """
+    assert _tags(MODELS["xl-sft"], seed=7) == _tags(MODELS["xl-sft"], seed=7)
+
+
+def test_the_written_file_carries_the_generation_it_came_from(tmp_path):
+    """End to end, because describe() and the writer are wired in two places."""
+    out = tmp_path / "song.flac"
+    tags = pipeline.describe(
+        MODELS["xl-sft"],
+        req := pipeline.GenerationRequest(
+            style_prompt="dream pop, warm analog tape", lyrics="[verse]\nCity lights"
+        ),
+        pipeline.resolve_settings(MODELS["xl-sft"], req),
+    )
+    pipeline.write_audio(out, _tone(), models.SAMPLE_RATE, tags)
+
+    written = flac_comments(out.read_bytes())
+    assert written["DESCRIPTION"] == "dream pop, warm analog tape"
+    assert written["LYRICS"] == "[verse]\nCity lights"
+    assert written["AS15_MODEL"] == "xl-sft"
+
+
+def test_a_write_without_tags_leaves_the_encoder_to_it(tmp_path):
+    """The default path is unchanged: no tags means no rewrite of the stream."""
+    out = tmp_path / "song.flac"
+    pipeline.write_audio(out, _tone(), models.SAMPLE_RATE)
+
+    assert flac_comments(out.read_bytes()) == {}
 
 
 def test_the_latent_window_matches_what_conditioning_sizes():

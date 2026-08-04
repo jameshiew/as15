@@ -102,6 +102,31 @@ Useful options:
 | `--dcw / --no-dcw` | per model | See above; leave alone unless experimenting |
 | `--precision` | `bf16` | `fp32` doubles memory for no measurable gain |
 
+## What a take remembers
+
+Every file carries the run that made it, as Vorbis comments — otherwise which
+command produced which take lasts until you close the terminal:
+
+```bash
+ffprobe -v error -show_entries format_tags song.flac
+```
+
+`DESCRIPTION` is the style prompt and `LYRICS` the sheet as given: multi-line and
+Unicode, in one field. The rest is the recipe — `AS15_CHECKPOINT` (repo *and*
+commit, because upstream force-pushes weights under the same ID), `AS15_SEED`,
+`AS15_STEPS`, `AS15_GUIDANCE`, `AS15_SHIFT`, `AS15_SAMPLER`, `AS15_INFER_METHOD`,
+`AS15_DCW`, `AS15_PRECISION`, `AS15_DURATION`, `AS15_LANGUAGE`, plus `AS15_BPM`,
+`AS15_KEY` and `AS15_TIME_SIGNATURE` when you set them. Each is the value that
+actually ran rather than the one asked for, so a turbo take records
+`AS15_GUIDANCE=1` and not the 7 it ignored. None of them is a clock or a machine
+ID: the same command twice still writes byte-identical files.
+
+No dependency does this. libsndfile sets ten fixed Vorbis fields and lyrics is not
+one of them, and every Python tagging library is either GPL (mutagen, pytaglib) or
+an MIT wrapper that imports one at runtime (mediafile, music-tag) — so
+`src/as15/flac.py` writes the comment block itself, about forty lines of
+[RFC 9639](https://www.rfc-editor.org/rfc/rfc9639.html).
+
 ## How it runs
 
 | Stage | Runtime | Params | When |

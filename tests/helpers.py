@@ -18,6 +18,82 @@ def request(**kwargs):
     return GenerationRequest(style_prompt="a song", lyrics="", **kwargs)
 
 
+# --- reading a FLAC container ---------------------------------------------
+#
+# Written out here rather than imported from as15.flac, which is what these
+# check: a round trip through a writer and its own inverse agrees with itself
+# about any consistent misreading of the format. Kept together because the
+# pipeline's tests want the comments and the container's tests want the blocks
+# they sit in.
+
+
+def flac_blocks(data: bytes) -> list[tuple[int, bool, bytes]]:
+    """Every metadata block as ``(type, is_last, payload)``."""
+    assert data[:4] == b"fLaC"
+    found, pos = [], 4
+    while True:
+        kind, last = data[pos] & 0x7F, bool(data[pos] & 0x80)
+        length = int.from_bytes(data[pos + 1 : pos + 4], "big")
+        found.append((kind, last, data[pos + 4 : pos + 4 + length]))
+        pos += 4 + length
+        if last:
+            return found
+
+
+def flac_frames(data: bytes) -> bytes:
+    """Everything after the metadata: the encoded audio."""
+    pos = 4
+    while True:
+        last = bool(data[pos] & 0x80)
+        pos += 4 + int.from_bytes(data[pos + 1 : pos + 4], "big")
+        if last:
+            return data[pos:]
+
+
+def flac_stream(blocks: list[tuple[int, bytes]], frames: bytes) -> bytes:
+    """The inverse of :func:`flac_blocks`, for building a stream to feed in."""
+    out = bytearray(b"fLaC")
+    for index, (kind, payload) in enumerate(blocks):
+        out.append((0x80 if index == len(blocks) - 1 else 0) | kind)
+        out += len(payload).to_bytes(3, "big") + payload
+    return bytes(out) + frames
+
+
+def _comment_payload(data: bytes) -> bytes | None:
+    return next((b for kind, _, b in flac_blocks(data) if kind == 4), None)
+
+
+def flac_vendor(data: bytes) -> bytes | None:
+    """The vendor string the comment block opens with, or None if there is none."""
+    payload = _comment_payload(data)
+    if payload is None:
+        return None
+    return payload[4 : 4 + int.from_bytes(payload[:4], "little")]
+
+
+def flac_comments(data: bytes) -> dict[str, str]:
+    """The comment block's ``NAME=value`` entries, parsed little-endian."""
+    payload = _comment_payload(data)
+    if payload is None:
+        return {}
+
+    def take(pos: int) -> tuple[bytes, int]:
+        size = int.from_bytes(payload[pos : pos + 4], "little")
+        return payload[pos + 4 : pos + 4 + size], pos + 4 + size
+
+    _vendor, pos = take(0)
+    count = int.from_bytes(payload[pos : pos + 4], "little")
+    pos += 4
+
+    tags = {}
+    for _ in range(count):
+        entry, pos = take(pos)
+        name, _, value = entry.decode().partition("=")
+        tags[name] = value
+    assert pos == len(payload), "the block's own length disagrees with its entries"
+    return tags
+
+
 class ConstantDecoder:
     """Stand-in for the DiT that records the timestep of every evaluation.
 

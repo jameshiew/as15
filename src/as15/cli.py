@@ -246,7 +246,7 @@ def sing(
     # destination or a decode that came back non-finite is reported as an
     # error, having left whatever was at *out* alone.
     try:
-        write_audio(out, result.audio, result.sample_rate)
+        write_audio(out, result.audio, result.sample_rate, result.tags)
     except (ValueError, OSError) as exc:
         _err(f"Could not write {out}: {exc}")
         raise typer.Exit(1) from None

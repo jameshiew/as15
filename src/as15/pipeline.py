@@ -6,14 +6,17 @@ import gc
 import json
 import os
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 import numpy as np
 
+from . import __version__
 from .atomic import publish
 from .convert import convert_dit, convert_vae, resolve_precision
+from .flac import set_comments
 from .mlx.sampler import check_guidance, check_sampling_options
 from .models import (
     BASE_REPO,
@@ -105,6 +108,8 @@ class GenerationResult:
     sample_rate: int
     seed: int | None
     timings: dict[str, float | str] = field(default_factory=dict)
+    # Vorbis comments describing the run, for write_audio to embed.
+    tags: dict[str, str] = field(default_factory=dict)
 
 
 # Duration bounds, shared by the CLI flag and by callers that build a request
@@ -220,6 +225,67 @@ def resolve_settings(spec: ModelSpec, request: GenerationRequest) -> Settings:
         dcw=dcw,
         compute_dtype=compute_dtype,
     )
+
+
+def describe(
+    spec: ModelSpec, request: GenerationRequest, settings: Settings
+) -> dict[str, str]:
+    """The Vorbis comments a generation leaves in its own output.
+
+    Everything a take cannot be recovered from the audio: the words that were
+    sung, the prompt they were sung to, and the recipe for generating it again.
+    The alternative is remembering which shell history line produced which
+    file, which lasts until the next reboot.
+
+    Read off the *resolved* settings for the same reason the banner is -- what
+    is recorded has to be what ran, not what was asked for. A turbo take says
+    ``guidance 1`` because CFG was dropped, and a request that left steps unset
+    records the checkpoint's number rather than nothing.
+
+    Nothing here is a clock or a machine ID: the tags are a function of the
+    request alone, so two runs of the same command still produce byte-identical
+    files and a regeneration can be diffed against the take it replaces.
+    """
+    tags = {"DESCRIPTION": request.style_prompt}
+    # An instrumental has no lyric sheet, and an empty LYRICS field is not the
+    # same claim as an absent one -- players render the first as a blank pane.
+    if request.lyrics.strip():
+        tags["LYRICS"] = request.lyrics
+
+    tags["AS15_VERSION"] = __version__
+    tags["AS15_MODEL"] = spec.key
+    # The commit, not the repo ID: upstream force-pushes weights under the same
+    # ID, so the ID alone does not say which bytes sang this.
+    tags["AS15_CHECKPOINT"] = f"{spec.repo_id}@{spec.revision}"
+    # Absent for an unseeded draw. The CLI always picks a seed, but a caller
+    # building the request itself may leave it None, and a number here would
+    # promise a reproducibility the file does not have.
+    if request.seed is not None:
+        tags["AS15_SEED"] = str(request.seed)
+
+    tags["AS15_DURATION"] = f"{request.duration:g}"
+    tags["AS15_LANGUAGE"] = request.language
+    tags["AS15_STEPS"] = str(settings.steps)
+    tags["AS15_GUIDANCE"] = f"{settings.guidance:g}"
+    tags["AS15_SHIFT"] = f"{settings.shift:g}"
+    tags["AS15_SAMPLER"] = request.sampler
+    tags["AS15_INFER_METHOD"] = request.infer_method
+    tags["AS15_DCW"] = "on" if settings.dcw else "off"
+    # The name the flag takes rather than the dtype it resolves to, so every
+    # AS15_ tag is something that can be typed straight back at the CLI.
+    tags["AS15_PRECISION"] = request.precision
+
+    # The conditioning metas, which are only in the file if they were set: the
+    # model is told "N/A" for an unset one, and recording that as a value would
+    # make an unset tempo indistinguishable from one deliberately given.
+    for name, value in (
+        ("AS15_BPM", request.bpm),
+        ("AS15_KEY", request.key_scale),
+        ("AS15_TIME_SIGNATURE", request.time_signature),
+    ):
+        if value is not None:
+            tags[name] = str(value)
+    return tags
 
 
 def _resolve_snapshots(spec: ModelSpec) -> tuple[Snapshot, Snapshot]:
@@ -366,6 +432,7 @@ def generate(
         sample_rate=SAMPLE_RATE,
         seed=request.seed,
         timings=timings,
+        tags=describe(spec, request, settings),
     )
 
 
@@ -415,14 +482,25 @@ def check_output_path(path: Path) -> None:
         raise ValueError(f"{existing} is not writable.")
 
 
-def write_audio(path: Path, audio: np.ndarray, sample_rate: int) -> None:
+def write_audio(
+    path: Path,
+    audio: np.ndarray,
+    sample_rate: int,
+    tags: Mapping[str, str] | None = None,
+) -> None:
     """Write audio, peak-limiting only if the decode overshot full scale.
+
+    *tags* are Vorbis comments -- :func:`describe` builds the ones a generation
+    carries -- installed after the encoder has closed, because libsndfile can
+    only set ten fixed fields and lyrics are not one of them. See
+    :mod:`as15.flac`.
 
     The file appears whole or not at all: soundfile encodes into a temporary
     alongside it, which is renamed over *path* once the encoder has closed.
     A write that ran out of disk, or was interrupted, used to leave a
     truncated file where the song should be -- having already destroyed the
-    take that was there before.
+    take that was there before. Tagging happens on that same temporary, so a
+    rewrite that fails part way through is discarded with it.
 
     :func:`check_output_path` runs first, so what the CLI preflights and what
     the write accepts are the same rules rather than two copies of them.
@@ -447,8 +525,10 @@ def write_audio(path: Path, audio: np.ndarray, sample_rate: int) -> None:
         # Leave a shade of headroom so 16-bit conversion cannot wrap.
         audio = audio * (0.999 / peak)
 
+    def encode(tmp: Path) -> None:
+        sf.write(str(tmp), audio, sample_rate, subtype=OUTPUT_SUBTYPE)
+        if tags:
+            set_comments(tmp, tags)
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    publish(
-        path,
-        lambda tmp: sf.write(str(tmp), audio, sample_rate, subtype=OUTPUT_SUBTYPE),
-    )
+    publish(path, encode)
