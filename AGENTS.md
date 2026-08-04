@@ -13,9 +13,11 @@ Run the full gate suite and let it pass:
 just check
 ```
 
-That is `ruff check`, `ruff format --check`, `ty check`, `pytest`, in the order
-that gives the most useful first failure. `just tidy` formats and autofixes
-first, then runs the same gates.
+That is `ruff check`, `tombi lint`, `ruff format --check`, `tombi format
+--check`, `ty check`, `pytest`, in the order that gives the most useful first
+failure. `just tidy` formats and autofixes first, then runs the same gates.
+Every one of those runs under `uv run` from the dev dependency group, so
+`uv sync` is the only setup -- do not reach for a globally installed tool.
 
 The tests do not cover generation -- they pin constants, weight-conversion
 layouts and latent geometry, none of which run a model. A change that could

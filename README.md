@@ -145,6 +145,15 @@ uv run pytest -q
 These pin the conditioning and weight-layout invariants that produce
 correct-looking-but-wrong audio when broken.
 
+The full gate suite -- ruff, tombi, ty, pytest -- is:
+
+```bash
+just check
+```
+
+Everything it runs comes from the dev dependency group, so `uv sync` is the
+only setup beyond [just](https://just.systems/).
+
 ## Licence
 
 Code here is MIT. The ACE-Step 1.5 checkpoints are MIT and, per the model cards,
