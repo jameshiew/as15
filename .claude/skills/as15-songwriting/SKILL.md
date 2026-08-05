@@ -1,6 +1,6 @@
 ---
 name: as15-songwriting
-description: Write and generate songs with as15 (ACE-Step 1.5 XL on MLX). Covers style prompts, lyric sheets with structure tags, choosing duration/BPM/key/time signature, picking a checkpoint, and the draft-then-render loop. Use when the user wants to create, write, plan or generate a song in this repository.
+description: Write and generate songs with as15 (ACE-Step 1.5 XL on MLX). Covers which genres the model renders well, style prompts, lyric sheets with structure tags, choosing duration/BPM/key/time signature, picking a checkpoint, planning with the 5Hz LM, and the draft-then-render loop. Use when the user wants to create, write, plan or generate a song in this repository.
 allowed-tools: Read, Write, Bash
 ---
 
@@ -78,6 +78,32 @@ detail onto one.
    token -- cheaper than enumerating the same thing instrument by instrument.
 5. Keep the prompt and the lyric tags consistent. If the prompt says piano ballad,
    a `[guitar solo]` tag is a fight the output loses.
+
+### Genre fit
+
+Genre is the first choice and the model is not equally good at all of them. From
+upstream's own [1.5 page](https://ace-step.github.io/ace-step-v1.5.github.io/)
+and the reported results in
+[discussion #235](https://github.com/ace-step/ACE-Step-1.5/discussions/235):
+
+| Renders reliably | Struggles |
+| --- | --- |
+| House, techno, drum and bass, lo-fi | Guitar-forward punk and metal -- comes back "poppy-rock sounding" |
+| Pop, synth-pop, indie | Rap outside English; `zh_rap` is named on the model card |
+| Folk and acoustic singer-songwriter | Lyrics in any language the take is not conditioned for |
+| Orchestral and cinematic | Several niche genres stacked -- the signals cancel and the output muds |
+| Boom bap, trap, lo-fi hip hop | |
+
+Two of upstream's stated weaknesses are worth designing around rather than
+fighting. **Coarse vocal synthesis lacking nuance**: a genre where the vocal is
+processed -- house, synth-pop, shoegaze -- hides it, and a style whose whole
+appeal is an unadorned voice a foot from the microphone is the hardest thing you
+can ask for. **Limited multilingual lyrics compliance**: English is the safe
+default and `--language` has to match the words either way.
+
+A steady grid is also the cheapest thing you can give a long take. Four-on-the-floor
+at a fixed `--bpm` gives the model something to hold across three or four
+minutes; the same length of rubato has nothing keeping it honest.
 
 ---
 
@@ -207,12 +233,26 @@ uv run as15 models
 | Guidance | 7.0 | none (distilled; `-g` ignored) |
 | Shift | 1.0 | 3.0 |
 | DCW | off | on |
-| Relative speed | 1x | ~6x |
+| Relative speed | 1x | ~15x |
 | Use for | the take you keep | drafting and iteration |
 
-Scaling the README's M5 timings, a 120 s take is roughly **10 minutes** of
-diffusion on `xl-sft` and roughly **40 seconds** on `xl-turbo`. That ratio is the
-whole workflow: iterate on turbo, render on sft.
+**Do not scale the README's 30 s timings linearly** -- they overstate a
+full-length take by around 3x. A large part of every step is fixed work over the
+text conditioning, so the per-second cost falls as the take gets longer. Measured
+on an M5, 32 GB, for a **200 s** song:
+
+| Stage | Time |
+| --- | --- |
+| 4B plan (1000 codes) | 2 min 36 s |
+| `xl-turbo` diffusion | 24 s |
+| `xl-sft` diffusion | 6 min 3 s |
+| VAE decode (either) | ~36 s |
+
+Peak was 9.1--9.2 GB either way, since decode is chunked. A full-length sft render
+is minutes rather than the ~18 that linear scaling predicts -- but turbo is still
+**15x** cheaper, and that ratio is the whole workflow: iterate on turbo, render on
+sft. (It is 15x and not the 6x of the step counts because sft runs CFG, which is
+two forward passes per step.)
 
 - `-g / --guidance` (sft only): 7.0 is the default. Lower (3--5) follows the
   prompt more loosely and often sounds more natural; higher is more literal and
@@ -255,6 +295,35 @@ a time signature and writes them into its reasoning block, which is printed on
 stderr. Anything you set with `--bpm` / `--key` / `--time-signature` overrides
 it, and the duration is always yours. So `--plan` is a way to get a considered
 tempo and key rather than `N/A`, without having to pick them yourself.
+
+### Read the reasoning block
+
+It is not only metas. The planner writes itself a full prose caption of the song
+it is about to sketch, and **that caption can contradict your prompt.** A prompt
+saying `warm female vocals` came back with:
+
+```
+caption: ... The lead vocal is delivered by a smooth male singer using expressive
+falsetto, complemented by layered backing vocals including female harmonies ...
+```
+
+The DiT is conditioned on the plan *and* on your text, so the two then fight for
+the whole render. The fix is the ordinary one for prompt ambiguity -- say it
+twice, in different words (`warm female lead vocal, soulful female topline`) --
+and plan again. A re-plan is one LM pass; finding it after a six-minute sft
+render is not.
+
+The block goes to stderr, buried in the planner's progress bar, so it needs
+unpicking to read:
+
+```bash
+uv run as15 plan -p "..." -L lyrics.txt -d 200 -o out/song.codes 2>plan.log
+tr '\r' '\n' < plan.log | grep -viE 'planning:|Fetching'
+```
+
+Check it against the prompt before spending a render on it: the vocal, the
+instrumentation, and whether the structure it describes is the one your lyric
+tags asked for.
 
 Plans are worth keeping. Planning is one LM pass; rendering is fifty DiT passes,
 so write the plan once and render it several ways:
@@ -329,9 +398,13 @@ For the take you actually keep, the highest-quality configuration is `xl-sft`
 with a 4B plan, everything else left at its default:
 
 ```bash
-uv run as15 plan -p "..." -L lyrics.txt -d 200 --bpm 72 --key "A minor" -o out/song.codes
+uv run as15 plan -p "..." -L lyrics.txt -d 200 --bpm 72 --key "A minor" -o out/song.codes 2>plan.log
+tr '\r' '\n' < plan.log | grep -viE 'planning:|Fetching'   # does the caption match the prompt?
 uv run as15 sing --audio-codes out/song.codes -p "..." -L lyrics.txt -d 200 --bpm 72 --key "A minor" -o out/final.flac
 ```
+
+The middle line is not optional -- see §6. Reading the plan's caption costs
+nothing and catches a prompt the planner misread before the render pays for it.
 
 Then vary one thing at a time from that same plan -- the seed, or `-g` between 5
 and 7 -- and keep the take that sounds best. Nothing in this repo can tell you
@@ -370,75 +443,169 @@ uv run as15 download -m xl-sft
 
 ## Worked example
 
-Idea: "a late-night drive song about leaving a city, dream pop, female vocals".
+"Hold the Morning" -- the canonical run: 4B plan, `xl-sft`, everything else at
+its default. Every number below was measured on it.
+
+**Genre first.** The brief was only "something the model generates well", so §1's
+genre-fit table picked it: soulful deep house. Four-on-the-floor gives a 200 s
+take a grid to hold, the hook repeats so the lyric budget goes into one line, and
+the vocal sits under reverb -- which is where coarse vocal synthesis stops
+mattering. It also avoids the named weak spot, guitar-forward rock.
 
 **Prompt**
 
 ```
-dream pop, female vocals, shimmering reverb guitars, warm analog tape,
-patient mid-tempo drums, wide stereo synth pads, melancholic but not heavy
+soulful deep house, warm female lead vocal, soulful female topline,
+four-on-the-floor kick, deep round sub bass, dusty Rhodes chords,
+filtered analog pads, crisp shuffled hi-hats, spacious plate reverb,
+late-night club warmth
 ```
 
-**Metas** -- `--bpm 96`, `--key "A minor"`, no `--time-signature` (4 is implied
-by the genre and leaving it `N/A` costs nothing), `--language en`.
+Thirty words over genre, voice, five instruments, texture and production. The
+voice is named twice on purpose -- see the re-plan below.
 
-**Duration** -- intro 8 + verse 30 + chorus 25 + verse 30 + chorus 25 + bridge 20
-+ chorus 25 + outro 12 = ~175, so `-d 180`.
+**Metas** -- `--bpm 122` (house is tempo-defined), `--key "D minor"`,
+`--time-signature 4`, `--language en`.
 
-**Lyrics** (`lyrics.txt`)
+**Duration** -- intro 14 + verse 16 + build 16 + drop 24 + breakdown 12 +
+verse 16 + build 16 + drop 24 + bridge 14 + build 10 + drop 24 + outro 14 = ~200,
+so `-d 200`.
+
+**Lyrics** (`out/hold-the-morning.txt`)
 
 ```
 [intro]
 
 [verse]
-Headlights count the empty lanes
-Radio is mostly rain
-Every mile I used to know
-Turns to somewhere I don't go
+Nobody counted the hours
+Nobody watched the door
+The bassline knows my name
+I don't need mine anymore
 
-[chorus]
-Let the city keep the light
-I am driving out tonight
-Every bridge behind me burns
-Soft and slow (soft and slow)
+[build]
+Four in the morning, still standing
+Ceiling is starting to glow
+Hold it, hold it, hold it
+Don't let it go
+
+[chorus - drop]
+Hold the morning off a while
+Every hand up in the light
+We were never going home
+Not tonight (not tonight)
+Hold the morning off
+
+[breakdown]
 
 [verse]
-Took the long way past your street
-Didn't slow, didn't keep
-Half a life in one back seat
-Half a song I can't complete
+Somebody's coat on the floor
+Somebody's song on repeat
+The whole room breathes as one
+And nothing is waiting outside
 
-[chorus]
-Let the city keep the light
-I am driving out tonight
-Every bridge behind me burns
-Soft and slow (soft and slow)
+[build]
+Four in the morning, still standing
+Ceiling is starting to glow
+Hold it, hold it, hold it
+Don't let it go
 
-[bridge - building energy]
-And the dark is not a threat
-It is only what comes next
+[chorus - drop]
+Hold the morning off a while
+Every hand up in the light
+We were never going home
+Not tonight (not tonight)
+Hold the morning off
 
-[chorus - anthemic]
-LET THE CITY KEEP THE LIGHT
-I AM DRIVING OUT TONIGHT
-Every bridge behind me burns
-Soft and slow (soft and slow)
+[bridge - low energy]
+Let the light stand in the street
+Let it wait outside for me
+
+[build]
+One more hour
+One more hour
+ONE MORE HOUR
+
+[chorus - drop]
+HOLD THE MORNING OFF A WHILE
+EVERY HAND UP IN THE LIGHT
+We were never going home
+Not tonight (not tonight)
+Hold the morning off
 
 [outro]
+Not tonight (not tonight)
 [fade out]
 ```
 
-Lines run 7--8 syllables and stay parallel between the two verses. One metaphor --
-the drive out -- worked from three angles. The `(soft and slow)` echo is a backing
-vocal, the capitalised final chorus lifts it, and every tag is something the
-prompt already supports.
+Lines run 6--8 syllables and stay parallel across the two verses. One metaphor --
+refusing the dawn -- from three angles. `[build]` into `[chorus - drop]` three
+times is the shape the genre already wants; the empty `[intro]` and `[breakdown]`
+are deliberate instrumental sections; `(not tonight)` is a backing vocal and the
+capitalised last chorus lifts it.
 
-**Draft, then render**
+**Plan, and check it**
 
 ```bash
-uv run as15 sing -m xl-turbo --seed 7 -p "dream pop, female vocals, shimmering reverb guitars, warm analog tape, patient mid-tempo drums, wide stereo synth pads, melancholic but not heavy" -L lyrics.txt -d 180 --bpm 96 --key "A minor" -o out/draft.flac
+uv run as15 plan -p "$PROMPT" -L out/hold-the-morning.txt -d 200 \
+  --bpm 122 --key "D minor" --time-signature 4 --seed 1122 \
+  -o out/hold-the-morning.codes 2>plan.log
+tr '\r' '\n' < plan.log | grep -viE 'planning:|Fetching'
+```
+
+The first plan's caption described "a smooth male singer using expressive
+falsetto" against a prompt that said female vocals. The prompt gained a second,
+differently-worded statement of the voice (`warm female lead vocal, soulful female
+topline`) and the plan was rewritten at a new seed; the second came back with "a
+powerful female lead vocal ... layered backing vocals ... dynamic builds leading
+into instrumental drops". 2 min 36 s each time. **Do not skip this check** -- it
+is the cheapest step in the run and it guards the most expensive one.
+
+**Draft on turbo from that plan, then render on sft from the same plan**
+
+```bash
+uv run as15 sing -m xl-turbo --audio-codes out/hold-the-morning.codes \
+  -p "$PROMPT" -L out/hold-the-morning.txt -d 200 \
+  --bpm 122 --key "D minor" --time-signature 4 --seed 1123 \
+  -o out/hold-the-morning-draft.flac
 ```
 
 ```bash
-uv run as15 sing --seed 7 -p "dream pop, female vocals, shimmering reverb guitars, warm analog tape, patient mid-tempo drums, wide stereo synth pads, melancholic but not heavy" -L lyrics.txt -d 180 --bpm 96 --key "A minor" -o out/final.flac
+uv run as15 sing --audio-codes out/hold-the-morning.codes \
+  -p "$PROMPT" -L out/hold-the-morning.txt -d 200 \
+  --bpm 122 --key "D minor" --time-signature 4 --seed 1123 \
+  -o out/hold-the-morning.flac
 ```
+
+24 s of diffusion against 6 min 3 s, from one arrangement -- so the draft is a
+real preview of the final's shape, not a different song at the same tempo.
+
+### What you can check without listening
+
+Listening is still the decision. But a few cheap measurements catch a dead run
+before it wastes an audition, and they showed the sft take was the better one on
+every axis:
+
+| | draft (turbo) | final (sft) |
+| --- | --- | --- |
+| Dynamic range, 4 s RMS windows | 8.9 dB | **15.5 dB** |
+| Stereo width (side/mid RMS) | 0.27 | **0.83** |
+| Sample peak | 0.999, pinned to the ceiling | 0.877, with headroom |
+
+Worth checking on any take: that it is the length you asked for, that the peak is
+not pinned at 1.0, that the RMS envelope moves rather than sitting flat, and --
+if the sheet ends in `[fade out]` -- that the tail actually decays. This one went
+from -14.8 dB to -61.7 dB over its last four seconds.
+
+```bash
+uv run --with numpy --with soundfile python - <<'EOF'
+import numpy as np, soundfile as sf
+x, sr = sf.read("out/hold-the-morning.flac")
+m, w = x.mean(axis=1), 4 * 48000
+rms = np.array([np.sqrt((m[i:i+w]**2).mean()) for i in range(0, len(m)-w+1, w)])
+db = 20 * np.log10(np.maximum(rms, 1e-6))
+print(f"{len(m)/sr:.1f}s  peak={np.abs(x).max():.3f}  dyn={db.max()-db.min():.1f}dB")
+print("".join(" .:-=+*#%@"[min(9, int((d-db.min())/(db.max()-db.min())*9.99))] for d in db))
+EOF
+```
+
+None of that says whether it is any good. It says whether it is worth your ears.

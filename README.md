@@ -79,6 +79,22 @@ renders here, and one written here renders there. Every generated FLAC also
 carries its own plan in `AS15_AUDIO_CODES`, so a take can be re-rendered from
 the file it produced.
 
+Before rendering one, read what the planner thought it was writing. It reasons
+in the open on stderr — a bpm, a key, a time signature, and a prose caption of
+the arrangement — and the caption can disagree with the prompt you gave it. A
+prompt asking for female vocals has come back planning "a smooth male singer
+using expressive falsetto"; the DiT is conditioned on the plan *and* on the
+text, so a disagreement is two conditionings pulling against each other for the
+whole render. The block is buried in the progress bar, so:
+
+```bash
+uv run as15 plan -p "..." -L lyrics.txt -d 200 -o plan.codes 2>plan.log
+tr '\r' '\n' < plan.log | grep -viE 'planning:|Fetching'
+```
+
+Planning again costs one LM pass. Discovering it in the finished take costs the
+render.
+
 One difference from upstream worth knowing when moving plans between the two:
 a plan too short for `-d` is **rejected here**, naming how many codes are
 needed. Upstream pads the shortfall with silence and says nothing, which returns
@@ -145,7 +161,7 @@ Useful options:
 
 | Flag | Default | Notes |
 | --- | --- | --- |
-| `-m, --model` | `xl-sft` | `xl-sft` (best) or `xl-turbo` (~6x faster) |
+| `-m, --model` | `xl-sft` | `xl-sft` (best) or `xl-turbo` (~15x faster) |
 | `-o, --out` | `song.flac` | Must end in `.flac` |
 | `-d, --duration` | `120` | Seconds, 10–600, resolved onto the 40 ms latent grid |
 | `-s, --steps` | model default | 50 for sft, 8 for turbo |
@@ -209,14 +225,22 @@ indistinguishable, so bf16 is the default.
 
 ## Timings
 
-M5, 32 GB, 30 s of audio:
+M5, 32 GB:
 
-| Model | Steps | Diffusion | Decode | Peak |
+| Model | Steps | 30 s clip | 200 s song | Peak |
 | --- | --- | --- | --- | --- |
-| `xl-turbo` | 8 | ~10 s | ~6 s | 9.7 GB |
-| `xl-sft` | 50 | ~158 s | ~8 s | 9.6 GB |
+| `xl-turbo` | 8 | ~10 s + ~6 s decode | 24 s + 35 s decode | 9.1–9.7 GB |
+| `xl-sft` | 50 | ~158 s + ~8 s decode | 363 s + 36 s decode | 9.2–9.6 GB |
+| 4B planner | — | — | 2 min 36 s (1000 codes) | released before the DiT loads |
 
-Decode is chunked, so peak memory is flat in duration; diffusion time scales with it.
+Decode is chunked, so peak memory is flat in duration. Diffusion time grows with
+duration but **well below linearly** — a large part of every step is fixed work
+over the text conditioning, so 6.7x the audio costs only ~2.3x the time on both
+checkpoints. Scaling the 30 s row up is not a useful estimate of a full-length
+take; it overstates it by around 3x.
+
+The gap between the two checkpoints is ~15x, not the ~6x of the step counts:
+`xl-sft` runs CFG, which is two forward passes per step.
 
 ## Tests
 

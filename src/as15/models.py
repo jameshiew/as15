@@ -132,7 +132,7 @@ MODELS: dict[str, ModelSpec] = {
         supports_cfg=False,
         dcw=True,
         shift=3.0,
-        description="4B DiT, distilled. 8 steps, no CFG - roughly 6x faster.",
+        description="4B DiT, distilled. 8 steps, no CFG - roughly 15x faster.",
     ),
 }
 
