@@ -7,7 +7,8 @@
 # - ``euler``: First-order Euler ODE/SDE step (default, original behaviour).
 # - ``heun``: Second-order Heun predictor-corrector -- evaluates the model
 #   twice per step and averages the predictions for higher accuracy, which
-#   matters especially with 8-step turbo inference.
+#   matters especially with 8-step turbo inference. ODE only: the corrector
+#   has no SDE step to correct, so that pairing is rejected rather than run.
 #
 # Upstream's loop carries a good deal more than that: cover switching, repaint,
 # retake, ``mx.compile``, an explicit timestep list, velocity norm clamping and
@@ -30,14 +31,10 @@ logger = logging.getLogger(__name__)
 
 
 class DiffusionResult(TypedDict):
-    """Return shape of :func:`mlx_generate_diffusion`.
-
-    ``time_costs`` mixes float durations with the ``sampler_mode`` label, hence
-    the widened value type.
-    """
+    """Return shape of :func:`mlx_generate_diffusion`."""
 
     target_latents: np.ndarray
-    time_costs: dict[str, float | str]
+    time_costs: dict[str, float]
 
 
 VALID_SAMPLER_MODES = {"euler", "heun"}
@@ -89,6 +86,18 @@ def check_sampling_options(
     if infer_method not in VALID_INFER_METHODS:
         raise ValueError(
             f"Unsupported infer_method '{infer_method}'. Expected one of {sorted(VALID_INFER_METHODS)}."
+        )
+    # Heun's corrector evaluates the model where an Euler step lands and
+    # averages the two velocities; an SDE step does not land there, it renoises
+    # towards the predicted clean sample, so there is no corrector to pair with
+    # it. The loop used to log a warning, run Euler, and let the caller record
+    # the take as a Heun one -- the same silent reinterpretation the checks
+    # above exist to stop, and one that survived into the file's own recipe.
+    if sampler_mode == "heun" and infer_method == "sde":
+        raise ValueError(
+            "sampler_mode 'heun' needs infer_method 'ode': Heun corrects an ODE "
+            "step, and an SDE step is not one. Pass infer_method='ode', or "
+            "sampler_mode='euler' to keep SDE."
         )
     check_schedule_options(shift, infer_steps)
 
@@ -218,19 +227,18 @@ def mlx_generate_diffusion(
         null_condition_emb_np: [1, 1, D] null condition embedding, required
             whenever ``guidance_scale`` is above 1.0.
         sampler_mode: Sampler algorithm -- ``"euler"`` (first-order, default) or
-            ``"heun"`` (second-order predictor-corrector for cleaner output).
+            ``"heun"`` (second-order predictor-corrector, ODE only).
         dcw_enabled: Apply the per-step wavelet-domain correction.
         compute_dtype: MLX dtype the whole loop runs in.
         disable_tqdm: If True, suppress the diffusion progress bar.
 
     Returns:
         Dict with ``"target_latents"`` (numpy) and ``"time_costs"`` dict.
-        ``time_costs["sampler_mode"]`` names the sampler that ran, which is
-        ``"euler"`` when a Heun request degraded under SDE.
 
     Raises:
         ValueError: If ``sampler_mode``, ``infer_method``, ``infer_steps``,
-            ``shift`` or ``guidance_scale`` is outside what this loop supports.
+            ``shift`` or ``guidance_scale`` is outside what this loop supports,
+            or if they are a pairing it cannot run.
     """
     import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 
@@ -248,25 +256,15 @@ def mlx_generate_diffusion(
             f"guide against; pass one, or guidance_scale=1.0 to run without CFG."
         )
 
-    # Heun's corrector is an ODE construction; under SDE every step is Euler.
-    # Track the sampler that will actually run, so the warning below and the
-    # ``sampler_mode`` reported in ``time_costs`` agree with each other.
-    effective_sampler_mode = sampler_mode
-    if sampler_mode == "heun" and infer_method == "sde":
-        logger.warning(
-            "[MLX-DiT] Heun sampler is not supported with SDE inference method. "
-            "Falling back to Euler. Use infer_method='ode' for Heun."
-        )
-        effective_sampler_mode = "euler"
-
-    use_heun = effective_sampler_mode == "heun"
+    # Heun implies ODE, which check_sampling_options has already insisted on.
+    use_heun = sampler_mode == "heun"
 
     if use_heun:
         logger.info(
             "[MLX-DiT] Using Heun (second-order) sampler for higher-quality output."
         )
 
-    time_costs: dict[str, float | str] = {}
+    time_costs: dict[str, float] = {}
     total_start = time.time()
 
     # Run the loop in the same dtype as the decoder weights. Feeding fp32
@@ -468,7 +466,6 @@ def mlx_generate_diffusion(
         "diffusion_time_cost"
     ] / max(num_steps, 1)
     time_costs["total_time_cost"] = total_end - total_start
-    time_costs["sampler_mode"] = effective_sampler_mode
 
     # numpy has no bfloat16, and MLX refuses the buffer protocol for it, so the
     # loop's dtype has to be widened here rather than at the call site.

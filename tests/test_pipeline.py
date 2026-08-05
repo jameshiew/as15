@@ -126,6 +126,33 @@ def test_a_distilled_checkpoint_reports_the_guidance_it_runs():
     assert resolved.guidance == 1.0
 
 
+def test_a_sampler_the_infer_method_cannot_run_is_rejected():
+    """heun+sde ran Euler, and every report of the run said heun.
+
+    The downgrade lived at the bottom of the diffusion loop, past the point
+    where anything could still be said about it: the banner had printed heun,
+    and ``describe`` reads the resolved request, so the take carried
+    ``AS15_SAMPLER=heun`` -- a recipe that regenerates a different take. It is
+    a pairing nobody can have meant, so it is refused up here with the rest of
+    them, before a byte is fetched.
+    """
+    with pytest.raises(ValueError, match="heun"):
+        pipeline.resolve_request(
+            MODELS["xl-sft"], request(sampler="heun", infer_method="sde")
+        )
+
+    # Neither half is a mistake by itself.
+    for spoiled in (
+        {"sampler": "heun", "infer_method": "ode"},
+        {"sampler": "euler", "infer_method": "sde"},
+    ):
+        resolved = pipeline.resolve_request(MODELS["xl-sft"], request(**spoiled))
+        assert (resolved.sampler, resolved.infer_method) == (
+            spoiled["sampler"],
+            spoiled["infer_method"],
+        )
+
+
 @pytest.mark.parametrize("seed", [-1, 2**64])
 def test_a_seed_outside_the_key_range_is_rejected(seed):
     """``mx.random.key`` takes a uint64 and raises TypeError outside it.
@@ -283,6 +310,7 @@ def _run_with_stub_stages(
                 "guidance": called_with["guidance_scale"],
                 "seed": called_with["seed"],
                 "sampler": called_with["sampler_mode"],
+                "infer_method": called_with["infer_method"],
                 "dcw": called_with["dcw_enabled"],
             }
         return {
@@ -635,5 +663,19 @@ def test_the_conditioning_and_the_diffusion_are_told_the_same_song(monkeypatch):
     assert resolved.latent_frames == 323
     assert resolved.metas_duration == 13
     assert seen["sampled"]["src_latents_shape"] == (1, 323, models.LATENT_CHANNELS)
-    for field in ("shift", "steps", "guidance", "seed", "sampler", "dcw"):
+    for field in (
+        "shift",
+        "steps",
+        "guidance",
+        "seed",
+        "sampler",
+        "infer_method",
+        "dcw",
+    ):
         assert seen["sampled"][field] == getattr(resolved, field), field
+
+    # And the file's own account of the run is that same resolved request, so
+    # the sampler the loop was handed is the sampler the take is tagged with.
+    tags = pipeline.describe(MODELS["xl-sft"], resolved)
+    assert tags["AS15_SAMPLER"] == seen["sampled"]["sampler"]
+    assert tags["AS15_INFER_METHOD"] == seen["sampled"]["infer_method"]

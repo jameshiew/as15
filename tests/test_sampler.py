@@ -224,20 +224,24 @@ def test_an_unknown_infer_method_is_rejected():
         run_sampler(ConstantDecoder(), infer_method="dpm")
 
 
-def test_heun_under_sde_reports_the_sampler_that_ran():
-    """Heun's corrector is an ODE construction, so SDE steps run Euler.
+def test_heun_under_sde_is_rejected_rather_than_quietly_downgraded():
+    """Heun corrects an ODE step, and an SDE step is not one.
 
-    The loop warned about the fallback and then reported ``heun`` back to the
-    caller anyway, which is what ends up in the timings.
+    The loop used to log a warning and run Euler for the whole schedule. The
+    warning is the only place that said so: the caller had already been told it
+    was sampling with Heun, and the take it wrote recorded ``heun`` as the
+    recipe -- which regenerates something else.
     """
     decoder = ConstantDecoder()
-    result = run_sampler(decoder, sampler_mode="heun", infer_method="sde")
+    with pytest.raises(ValueError, match="heun"):
+        run_sampler(decoder, sampler_mode="heun", infer_method="sde")
 
-    assert result["time_costs"]["sampler_mode"] == "euler"
-    assert len(decoder.timesteps) == STEPS  # one evaluation per step, not two
+    assert not decoder.timesteps, "the pairing was checked after the first step"
 
-    ode = run_sampler(ConstantDecoder(), sampler_mode="heun")
-    assert ode["time_costs"]["sampler_mode"] == "heun"
+    # Each half of it is still fine on its own.
+    heun = run_sampler(ConstantDecoder(), sampler_mode="heun")
+    assert heun["target_latents"].shape == NOISE_SHAPE
+    run_sampler(ConstantDecoder(), infer_method="sde")
 
 
 def test_asking_for_cfg_without_a_null_embedding_is_rejected():
@@ -284,8 +288,13 @@ class _DtypeRecordingDecoder(ConstantDecoder):
         return super().__call__(**kwargs)
 
 
-@pytest.mark.parametrize("sampler_mode", ["euler", "heun"])
-@pytest.mark.parametrize("infer_method", ["ode", "sde"])
+# Every branch of the step, which is three of the four combinations: heun+sde
+# is not one the loop runs, and the Euler it used to degrade to under SDE was
+# the euler+sde case below.
+@pytest.mark.parametrize(
+    "sampler_mode,infer_method",
+    [("euler", "ode"), ("euler", "sde"), ("heun", "ode")],
+)
 def test_the_loop_stays_in_the_compute_dtype(sampler_mode, infer_method):
     """``mx.full`` infers float32 from a Python float.
 

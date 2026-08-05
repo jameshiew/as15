@@ -110,7 +110,7 @@ class GenerationResult:
     audio: np.ndarray  # [samples, channels], float32
     sample_rate: int
     seed: int | None
-    timings: dict[str, float | str] = field(default_factory=dict)
+    timings: dict[str, float] = field(default_factory=dict)
     # Vorbis comments describing the run, for write_audio to embed.
     tags: dict[str, str] = field(default_factory=dict)
 
@@ -411,7 +411,7 @@ def generate(
     # reads *request* again: every stage is handed the resolved one, so none of
     # them can settle a default or a duration differently from the others.
     resolved = resolve_request(spec, request)
-    timings: dict[str, float | str] = {}
+    timings: dict[str, float] = {}
 
     # The peak counter is process-global and never decays, so a second
     # generate() in the same process would otherwise report whichever earlier
