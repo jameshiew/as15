@@ -6,7 +6,7 @@ import json
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
-from math import prod
+from math import floor, prod
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -27,6 +27,17 @@ LATENT_FPS = SAMPLE_RATE // VAE_HOP  # 25
 LATENT_CHANNELS = 64
 
 
+def round_half_up(value: float) -> int:
+    """*value* to the nearest integer, resolving an exact half upwards.
+
+    ``round`` resolves a half to the *even* neighbour instead, which is a fine
+    rule for a sum of measurements and a poor one for a length: it sends 120.5 s
+    down to 3012 frames and 121.5 s up to 3038, so the same half-frame of asking
+    rounds in two directions depending on where it lands.
+    """
+    return floor(value + 0.5)
+
+
 def latent_frames_for(duration: float) -> int:
     """How many latent frames *duration* seconds of audio occupies.
 
@@ -36,7 +47,19 @@ def latent_frames_for(duration: float) -> int:
     place and the other way in the other decodes a track a frame short of the
     context it was generated against.
     """
-    return max(1, round(duration * LATENT_FPS))
+    return max(1, round_half_up(duration * LATENT_FPS))
+
+
+def seconds_for(frames: int) -> float:
+    """How long *frames* latent frames decode to.
+
+    The other half of :func:`latent_frames_for`, and the only duration that
+    describes a finished take: the decoder emits exactly ``VAE_HOP`` samples per
+    frame, so what comes back is a whole number of 40 ms frames whatever was
+    asked for. A request for 12.9 s is 323 frames is 12.92 s of audio, and no
+    stage downstream of the resolution can produce anything else.
+    """
+    return frames / LATENT_FPS
 
 
 def check_vae_geometry(cfg: Mapping[str, Any]) -> None:

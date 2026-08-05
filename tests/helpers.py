@@ -2,7 +2,7 @@
 
 Everything here is sized so a test costs milliseconds: the sampler tests drive
 a decoder that predicts a constant, and the requests are the smallest ones
-``resolve_settings`` accepts. Nothing loads a checkpoint.
+``resolve_request`` accepts. Nothing loads a checkpoint.
 """
 
 from __future__ import annotations
@@ -11,11 +11,25 @@ import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
 import numpy as np
 
 
-def request(**kwargs):
-    """A request that resolve_settings accepts, before *kwargs* spoils it."""
+def request(style_prompt: str = "a song", lyrics: str = "", **kwargs):
+    """A request that resolve_request accepts, before *kwargs* spoils it."""
     from as15.pipeline import GenerationRequest
 
-    return GenerationRequest(style_prompt="a song", lyrics="", **kwargs)
+    return GenerationRequest(style_prompt=style_prompt, lyrics=lyrics, **kwargs)
+
+
+def resolved(model: str = "xl-sft", **kwargs):
+    """What the pipeline makes of :func:`request`, for the stages that run it.
+
+    Every stage past resolution is handed one of these rather than the request,
+    so this is what they have to be driven with in a test too -- and a test that
+    invented its own resolved values would no longer be exercising the
+    resolution the pipeline performs.
+    """
+    from as15.models import MODELS
+    from as15.pipeline import resolve_request
+
+    return resolve_request(MODELS[model], request(**kwargs))
 
 
 # --- reading a FLAC container ---------------------------------------------

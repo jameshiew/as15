@@ -120,6 +120,23 @@ def test_the_banner_reports_the_settings_the_run_will_use(monkeypatch, tmp_path)
     assert seen["request"].steps is None, "the request still says 'the model's'"
 
 
+def test_the_banner_reports_the_duration_the_take_will_have(monkeypatch, tmp_path):
+    """The latent grid is 40 ms, so most durations are not generatable as typed.
+
+    The banner used to echo the flag, which is the one number in the run that
+    nothing downstream used: the model was told 12 seconds, 12.92 was generated
+    and 12.9 was printed and written into the file.
+    """
+    _stub_generate(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli.app, ["sing", "-p", "x", "-d", "12.9", "-o", str(tmp_path / "a.flac")]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "duration  12.92s" in result.stderr
+
+
 def test_an_omitted_seed_is_chosen_and_reported(monkeypatch, tmp_path):
     """ "Reuse the seed to reproduce a take" needs the seed to have been shown.
 

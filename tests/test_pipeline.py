@@ -31,7 +31,75 @@ def test_a_duration_the_pipeline_cannot_honour_is_rejected(duration):
     sized a latent tensor from whatever the caller passed.
     """
     with pytest.raises(ValueError, match="duration"):
-        pipeline.resolve_settings(MODELS["xl-sft"], request(duration=duration))
+        pipeline.resolve_request(MODELS["xl-sft"], request(duration=duration))
+
+
+# --- how long the take is -------------------------------------------------
+#
+# The latent grid is 40 ms, so a duration in seconds is a request rather than a
+# length. It used to be answered three times over: the metas block floored it,
+# the latent window rounded it, and the banner and the tags printed what was
+# typed. A 12.9 s request told the model 12 seconds, generated 12.92, and wrote
+# a file claiming 12.9 -- and lyric pacing is conditioned on the first of those.
+
+
+@pytest.mark.parametrize(
+    ("duration", "frames"),
+    [(10.0, 250), (12.9, 323), (120.0, 3000), (120.5, 3013), (599.99, 15000)],
+)
+def test_a_duration_becomes_one_frame_count_with_halves_rounding_up(duration, frames):
+    """``round`` sends a half to the even neighbour, which is not a length.
+
+    120.5 s went *down* to 3012 frames while 121.5 s went up to 3038: the same
+    half-frame of asking, resolved in two directions.
+    """
+    assert models.latent_frames_for(duration) == frames
+    assert (
+        pipeline.resolve_request(
+            MODELS["xl-sft"], request(duration=duration)
+        ).latent_frames
+        == frames
+    )
+
+
+def test_the_latent_window_is_never_empty():
+    """``resolve_request`` rejects anything this short; the floor is a backstop."""
+    assert models.latent_frames_for(0.0) == 1
+    assert models.latent_frames_for(0.01) == 1
+
+
+def test_every_stage_is_told_the_length_that_will_actually_be_generated():
+    """One resolution, and the four places that used to disagree read it.
+
+    The frame count is what the DiT generates and the VAE decodes, the seconds
+    are what those frames are worth, and the metas duration is that rounded to
+    the whole seconds the block was trained in -- 13, not the 12 that flooring
+    the request produced.
+    """
+    resolved = pipeline.resolve_request(MODELS["xl-sft"], request(duration=12.9))
+
+    assert resolved.latent_frames == 323
+    assert resolved.duration == 323 / models.LATENT_FPS == 12.92
+    assert resolved.metas_duration == 13
+
+    metas = conditioning.format_metas(None, None, None, resolved.metas_duration)
+    assert "- duration: 13 seconds\n" in metas
+    assert pipeline.describe(MODELS["xl-sft"], resolved)["AS15_DURATION"] == "12.92"
+
+
+def test_the_duration_a_take_records_resolves_back_to_that_take():
+    """The tags are a recipe, so AS15_DURATION has to be re-typeable.
+
+    Recording the length of the audio rather than the request is only an
+    improvement if handing it back produces the same frame count -- ``%g`` and
+    the 40 ms grid have to round-trip over the whole allowed range, not just at
+    the two ends of it.
+    """
+    lo = models.latent_frames_for(pipeline.MIN_DURATION)
+    hi = models.latent_frames_for(pipeline.MAX_DURATION)
+    for frames in range(lo, hi + 1):
+        recorded = f"{models.seconds_for(frames):g}"
+        assert models.latent_frames_for(float(recorded)) == frames, recorded
 
 
 @pytest.mark.parametrize("guidance", [0.5, 0.0, -10.0, float("nan"), float("inf")])
@@ -43,19 +111,19 @@ def test_guidance_that_does_not_mean_what_it_says_is_rejected(guidance):
     arithmetic and took the latents with it.
     """
     with pytest.raises(ValueError, match="guidance"):
-        pipeline.resolve_settings(MODELS["xl-sft"], request(guidance=guidance))
+        pipeline.resolve_request(MODELS["xl-sft"], request(guidance=guidance))
 
 
 def test_guidance_of_exactly_one_is_how_cfg_is_turned_off():
     """The bound above must not reject the documented way to disable CFG."""
-    settings = pipeline.resolve_settings(MODELS["xl-sft"], request(guidance=1.0))
-    assert settings.guidance == 1.0
+    resolved = pipeline.resolve_request(MODELS["xl-sft"], request(guidance=1.0))
+    assert resolved.guidance == 1.0
 
 
 def test_a_distilled_checkpoint_reports_the_guidance_it_runs():
     """xl-turbo has no null branch, so CFG is dropped rather than honoured."""
-    settings = pipeline.resolve_settings(MODELS["xl-turbo"], request(guidance=7.0))
-    assert settings.guidance == 1.0
+    resolved = pipeline.resolve_request(MODELS["xl-turbo"], request(guidance=7.0))
+    assert resolved.guidance == 1.0
 
 
 @pytest.mark.parametrize("seed", [-1, 2**64])
@@ -66,7 +134,7 @@ def test_a_seed_outside_the_key_range_is_rejected(seed):
     seed.
     """
     with pytest.raises(ValueError, match="seed"):
-        pipeline.resolve_settings(MODELS["xl-sft"], request(seed=seed))
+        pipeline.resolve_request(MODELS["xl-sft"], request(seed=seed))
 
     with pytest.raises(TypeError):
         mx.random.key(seed)
@@ -76,7 +144,7 @@ def test_a_seed_outside_the_key_range_is_rejected(seed):
 def test_a_bpm_that_is_not_a_tempo_is_rejected(bpm):
     """``bpm or 'N/A'`` renders 0 as *unset*; a negative one is written out."""
     with pytest.raises(ValueError, match="bpm"):
-        pipeline.resolve_settings(MODELS["xl-sft"], request(bpm=bpm))
+        pipeline.resolve_request(MODELS["xl-sft"], request(bpm=bpm))
 
 
 @pytest.mark.parametrize("time_signature", [5, 0, "4/4", "common"])
@@ -85,26 +153,62 @@ def test_a_time_signature_the_metas_block_was_not_trained_on_is_rejected(
 ):
     """--time-signature has always documented 2, 3, 4 or 6; now it means it."""
     with pytest.raises(ValueError, match="time_signature"):
-        pipeline.resolve_settings(
+        pipeline.resolve_request(
             MODELS["xl-sft"], request(time_signature=time_signature)
         )
 
 
 @pytest.mark.parametrize("time_signature", [2, 3, 4, 6, "4"])
 def test_the_documented_time_signatures_are_accepted(time_signature):
-    pipeline.resolve_settings(MODELS["xl-sft"], request(time_signature=time_signature))
+    pipeline.resolve_request(MODELS["xl-sft"], request(time_signature=time_signature))
 
 
 def test_settings_come_from_the_checkpoint_when_the_request_omits_them():
     """The CLI banner prints these, so they have to be the ones that run."""
     for spec in MODELS.values():
-        settings = pipeline.resolve_settings(spec, request())
-        assert (settings.steps, settings.shift, settings.dcw) == (
+        resolved = pipeline.resolve_request(spec, request())
+        assert (resolved.steps, resolved.shift, resolved.dcw) == (
             spec.steps,
             spec.shift,
             spec.dcw,
         )
-        assert settings.compute_dtype == "bfloat16"
+        assert resolved.compute_dtype == "bfloat16"
+
+
+def test_what_the_request_already_answered_is_carried_through_untouched():
+    """The stages downstream see only the resolved request.
+
+    Anything the request settled itself has to arrive there intact -- a field
+    dropped or mistyped in the resolution is a run conditioned on, or sampled
+    with, a value nobody asked for.
+    """
+    req = request(
+        style_prompt="dream pop",
+        lyrics="[verse]\nCity lights",
+        language="fr",
+        bpm=110,
+        key_scale="C minor",
+        time_signature=3,
+        seed=7,
+        sampler="heun",
+        infer_method="ode",
+        precision="fp32",
+    )
+    resolved = pipeline.resolve_request(MODELS["xl-sft"], req)
+
+    for field in (
+        "style_prompt",
+        "lyrics",
+        "language",
+        "bpm",
+        "key_scale",
+        "time_signature",
+        "seed",
+        "sampler",
+        "infer_method",
+        "precision",
+    ):
+        assert getattr(resolved, field) == getattr(req, field), field
 
 
 # --- stage cleanup -------------------------------------------------------
@@ -115,13 +219,18 @@ class _StageFailure(RuntimeError):
 
 
 def _run_with_stub_stages(
-    monkeypatch, log: list[str], fail_in: str | None = None
+    monkeypatch,
+    log: list[str],
+    fail_in: str | None = None,
+    seen: dict | None = None,
+    **kwargs,
 ) -> None:
     """Run generate() with every stage stubbed, failing in one of them.
 
     *log* collects what the pipeline loaded, ran and handed back, in order, so
     that the cleanup can be asserted on -- including when generate() raises --
-    without a checkpoint or 10 GB of weights.
+    without a checkpoint or 10 GB of weights. *seen*, if given, collects what
+    each stage was told; *kwargs* spoil the request the run is made with.
     """
     from as15.mlx import sampler
 
@@ -143,15 +252,18 @@ def _run_with_stub_stages(
         def release(self):
             log.append("conditioner released")
 
-        def build(self, **kwargs):
+        def build(self, request, instruction=None):
             stage("condition")
+            if seen is not None:
+                seen["conditioned"] = request
+            frames = request.latent_frames
             return conditioning.Conditioning(
                 encoder_hidden_states=np.zeros((1, 1, 8), np.float32),
                 context_latents=np.zeros(
-                    (1, 2, 2 * models.LATENT_CHANNELS), np.float32
+                    (1, frames, 2 * models.LATENT_CHANNELS), np.float32
                 ),
                 null_condition_emb=np.zeros((1, 1, 8), np.float32),
-                latent_frames=2,
+                latent_frames=frames,
                 text_prompt="",
                 lyrics_text="",
             )
@@ -161,8 +273,18 @@ def _run_with_stub_stages(
             stage("decode")
             return mx.zeros((1, latents.shape[1] * models.VAE_HOP, 2))
 
-    def fake_diffusion(**kwargs):
+    def fake_diffusion(**called_with):
         stage("diffuse")
+        if seen is not None:
+            seen["sampled"] = {
+                "src_latents_shape": called_with["src_latents_shape"],
+                "shift": called_with["shift"],
+                "steps": called_with["infer_steps"],
+                "guidance": called_with["guidance_scale"],
+                "seed": called_with["seed"],
+                "sampler": called_with["sampler_mode"],
+                "dcw": called_with["dcw_enabled"],
+            }
         return {
             "target_latents": np.zeros((1, 2, models.LATENT_CHANNELS), np.float32),
             "time_costs": {},
@@ -180,7 +302,7 @@ def _run_with_stub_stages(
     # stage allocated go back to the OS or stay checked out in MLX's cache.
     monkeypatch.setattr(mx, "clear_cache", lambda: log.append("mlx cache cleared"))
 
-    pipeline.generate(MODELS["xl-sft"], request(), progress=False)
+    pipeline.generate(MODELS["xl-sft"], request(**kwargs), progress=False)
 
 
 def test_every_stage_hands_its_memory_back_when_it_finishes(monkeypatch):
@@ -398,8 +520,7 @@ def test_the_channel_count_is_whatever_the_decode_produced(channels, tmp_path):
 
 
 def _tags(spec, **kwargs) -> dict[str, str]:
-    req = request(**kwargs)
-    return pipeline.describe(spec, req, pipeline.resolve_settings(spec, req))
+    return pipeline.describe(spec, pipeline.resolve_request(spec, request(**kwargs)))
 
 
 def test_the_tags_record_the_settings_that_ran_not_the_ones_asked_for():
@@ -429,9 +550,7 @@ def test_an_instrumental_carries_no_lyrics_field():
     spec = MODELS["xl-sft"]
     assert "LYRICS" not in _tags(spec)
 
-    req = pipeline.GenerationRequest(style_prompt="a song", lyrics="[verse]\nOh")
-    tags = pipeline.describe(spec, req, pipeline.resolve_settings(spec, req))
-    assert tags["LYRICS"] == "[verse]\nOh"
+    assert _tags(spec, lyrics="[verse]\nOh")["LYRICS"] == "[verse]\nOh"
 
 
 def test_an_unseeded_draw_does_not_claim_a_seed():
@@ -478,12 +597,10 @@ def test_the_tags_do_not_move_between_two_runs_of_the_same_request():
 def test_the_written_file_carries_the_generation_it_came_from(tmp_path):
     """End to end, because describe() and the writer are wired in two places."""
     out = tmp_path / "song.flac"
-    tags = pipeline.describe(
+    tags = _tags(
         MODELS["xl-sft"],
-        req := pipeline.GenerationRequest(
-            style_prompt="dream pop, warm analog tape", lyrics="[verse]\nCity lights"
-        ),
-        pipeline.resolve_settings(MODELS["xl-sft"], req),
+        style_prompt="dream pop, warm analog tape",
+        lyrics="[verse]\nCity lights",
     )
     pipeline.write_audio(out, _tone(), models.SAMPLE_RATE, tags)
 
@@ -501,21 +618,22 @@ def test_a_write_without_tags_leaves_the_encoder_to_it(tmp_path):
     assert flac_comments(out.read_bytes()) == {}
 
 
-def test_the_latent_window_matches_what_conditioning_sizes():
-    """One function, so the decode length and the conditioning agree.
+def test_the_conditioning_and_the_diffusion_are_told_the_same_song(monkeypatch):
+    """Every stage is handed the resolved request, and there is only one.
 
-    A duration that rounded one way here and another way in the conditioner
-    would decode to a track a frame short of the context it was generated
-    against -- which is what this could not actually catch while the
-    conditioner carried its own copy of the expression and this asserted the
-    copy against itself. There is one definition now, and the identity below
-    is what says so: re-inlining the arithmetic leaves an unused import, which
-    ruff fails.
+    The conditioner used to be passed the request's own fields and size its
+    window from them, so the length it conditioned on and the length the
+    sampler generated were two separate readings of the same number -- a track
+    a frame short of the context it was generated against, at whichever
+    duration the two roundings disagreed on.
     """
-    assert conditioning.latent_frames_for is models.latent_frames_for
+    log: list[str] = []
+    seen: dict = {}
+    _run_with_stub_stages(monkeypatch, log, seen=seen, duration=12.9)
 
-    for duration in (10.0, 30.0, 120.5, 600.0):
-        assert models.latent_frames_for(duration) == max(
-            1, round(duration * models.LATENT_FPS)
-        )
-    assert models.latent_frames_for(0.0) == 1
+    resolved = seen["conditioned"]
+    assert resolved.latent_frames == 323
+    assert resolved.metas_duration == 13
+    assert seen["sampled"]["src_latents_shape"] == (1, 323, models.LATENT_CHANNELS)
+    for field in ("shift", "steps", "guidance", "seed", "sampler", "dcw"):
+        assert seen["sampled"][field] == getattr(resolved, field), field

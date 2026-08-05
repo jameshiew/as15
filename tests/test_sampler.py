@@ -260,7 +260,7 @@ def test_asking_for_cfg_without_a_null_embedding_is_rejected():
 
 @pytest.mark.parametrize("guidance", [0.5, float("nan"), float("inf")])
 def test_the_loop_holds_callers_to_the_same_guidance_bound_as_the_cli(guidance):
-    """resolve_settings is not on the path of a caller who drives the loop directly."""
+    """resolve_request is not on the path of a caller who drives the loop directly."""
     with pytest.raises(ValueError, match="guidance"):
         run_sampler(ConstantDecoder(), **{**cfg_kwargs(), "guidance_scale": guidance})
 

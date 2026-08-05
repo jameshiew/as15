@@ -28,7 +28,10 @@ from .models import (
     Snapshot,
     check_vae_geometry,
     ensure_snapshot,
+    latent_frames_for,
     load_dit_config,
+    round_half_up,
+    seconds_for,
 )
 
 # Only the files we actually use; skips the 3.7 GB 5Hz LM and the 2B turbo DiT
@@ -127,13 +130,49 @@ MAX_SEED = 2**64 - 1
 
 
 @dataclass(frozen=True)
-class Settings:
-    """What a request actually runs with, once model defaults are filled in."""
+class ResolvedGenerationRequest:
+    """A request with every default filled in and every derived value settled.
 
+    A :class:`GenerationRequest` is what someone asked for, and several of its
+    fields do not answer a question any stage can act on: ``steps=None`` means
+    "the checkpoint's", and a duration is a real number where the runtime has a
+    40 ms frame grid. Each stage used to reach into the request and answer those
+    for itself, so they could answer differently -- ``duration=12.9`` told the
+    model 12 seconds, sized the latent window for 12.92, printed 12.9 in the
+    banner and recorded 12.9 in the file, and the one that mattered for lyric
+    pacing was the one that was wrong.
+
+    Resolution happens once, here, and every stage downstream reads this: the
+    banner, the conditioner, the diffusion loop and :func:`describe`. What is
+    reported is what ran because there is nothing else left to report.
+    """
+
+    # What to generate.
+    style_prompt: str
+    lyrics: str
+    language: str
+    bpm: int | str | None
+    key_scale: str | None
+    time_signature: str | int | None
+
+    # How long. Three numbers because the request's duration is not any of them:
+    # *latent_frames* is what the DiT generates and the VAE decodes, *duration*
+    # is what those frames are worth in seconds and therefore what the file will
+    # be, and *metas_duration* is whole seconds because that is the format the
+    # ``# Metas`` block was trained in.
+    latent_frames: int
+    duration: float
+    metas_duration: int
+
+    # How to sample.
+    seed: int | None
     steps: int
     guidance: float
     shift: float
+    sampler: str
+    infer_method: str
     dcw: bool
+    precision: str
     compute_dtype: str
 
 
@@ -170,8 +209,10 @@ def _check_time_signature(time_signature: str | int | None) -> None:
         )
 
 
-def resolve_settings(spec: ModelSpec, request: GenerationRequest) -> Settings:
-    """Fill in the checkpoint's defaults, rejecting a request that cannot run.
+def resolve_request(
+    spec: ModelSpec, request: GenerationRequest
+) -> ResolvedGenerationRequest:
+    """Settle a request into the one form every stage runs from.
 
     Both the pipeline and the CLI go through here -- the pipeline before it
     fetches ~10 GB of weights, the CLI before it prints what it is about to do
@@ -218,18 +259,39 @@ def resolve_settings(spec: ModelSpec, request: GenerationRequest) -> Settings:
     _check_bpm(request.bpm)
     _check_time_signature(request.time_signature)
 
-    return Settings(
+    # The duration collapses to a frame count here and is never interpreted
+    # again: the latent grid is 40 ms, so the request's real number names a
+    # take that cannot be generated, and rounding it separately in the metas
+    # block, the context window and the tags is how they came to disagree.
+    frames = latent_frames_for(request.duration)
+    duration = seconds_for(frames)
+
+    return ResolvedGenerationRequest(
+        style_prompt=request.style_prompt,
+        lyrics=request.lyrics,
+        language=request.language,
+        bpm=request.bpm,
+        key_scale=request.key_scale,
+        time_signature=request.time_signature,
+        latent_frames=frames,
+        duration=duration,
+        # Of the length being generated, not of the length asked for: a 12.9 s
+        # request is a 12.92 s take, and the model is told 13 rather than the
+        # 12 that flooring the request produced.
+        metas_duration=round_half_up(duration),
+        seed=request.seed,
         steps=steps,
         guidance=guidance,
         shift=shift,
+        sampler=request.sampler,
+        infer_method=request.infer_method,
         dcw=dcw,
+        precision=request.precision,
         compute_dtype=compute_dtype,
     )
 
 
-def describe(
-    spec: ModelSpec, request: GenerationRequest, settings: Settings
-) -> dict[str, str]:
+def describe(spec: ModelSpec, request: ResolvedGenerationRequest) -> dict[str, str]:
     """The Vorbis comments a generation leaves in its own output.
 
     Everything a take cannot be recovered from the audio: the words that were
@@ -237,10 +299,13 @@ def describe(
     The alternative is remembering which shell history line produced which
     file, which lasts until the next reboot.
 
-    Read off the *resolved* settings for the same reason the banner is -- what
+    Read off the *resolved* request for the same reason the banner is -- what
     is recorded has to be what ran, not what was asked for. A turbo take says
-    ``guidance 1`` because CFG was dropped, and a request that left steps unset
-    records the checkpoint's number rather than nothing.
+    ``guidance 1`` because CFG was dropped, a request that left steps unset
+    records the checkpoint's number rather than nothing, and the duration is the
+    length of the audio in the file rather than the number typed at the CLI.
+    Every one of them still resolves back to itself, so a tag can be handed
+    straight back to ``as15 sing`` and generate the same take.
 
     Nothing here is a clock or a machine ID: the tags are a function of the
     request alone, so two runs of the same command still produce byte-identical
@@ -263,14 +328,17 @@ def describe(
     if request.seed is not None:
         tags["AS15_SEED"] = str(request.seed)
 
+    # The take's own length, which is a whole number of 40 ms frames. Recording
+    # the request's duration instead described a file that was never written:
+    # two of them resolve to the same audio, and neither is what the audio is.
     tags["AS15_DURATION"] = f"{request.duration:g}"
     tags["AS15_LANGUAGE"] = request.language
-    tags["AS15_STEPS"] = str(settings.steps)
-    tags["AS15_GUIDANCE"] = f"{settings.guidance:g}"
-    tags["AS15_SHIFT"] = f"{settings.shift:g}"
+    tags["AS15_STEPS"] = str(request.steps)
+    tags["AS15_GUIDANCE"] = f"{request.guidance:g}"
+    tags["AS15_SHIFT"] = f"{request.shift:g}"
     tags["AS15_SAMPLER"] = request.sampler
     tags["AS15_INFER_METHOD"] = request.infer_method
-    tags["AS15_DCW"] = "on" if settings.dcw else "off"
+    tags["AS15_DCW"] = "on" if request.dcw else "off"
     # The name the flag takes rather than the dtype it resolves to, so every
     # AS15_ tag is something that can be typed straight back at the CLI.
     tags["AS15_PRECISION"] = request.precision
@@ -339,8 +407,10 @@ def generate(
     from .mlx.sampler import mlx_generate_diffusion
 
     # Reject a malformed request here rather than after the snapshots have been
-    # fetched and the conditioner has run, which is minutes in.
-    settings = resolve_settings(spec, request)
+    # fetched and the conditioner has run, which is minutes in. Nothing below
+    # reads *request* again: every stage is handed the resolved one, so none of
+    # them can settle a default or a duration differently from the others.
+    resolved = resolve_request(spec, request)
     timings: dict[str, float | str] = {}
 
     # The peak counter is process-global and never decays, so a second
@@ -364,15 +434,7 @@ def generate(
     # an out-of-memory naming some entirely different stage.
     t0 = time.time()
     with conditioner:
-        cond = conditioner.build(
-            style_prompt=request.style_prompt,
-            lyrics=request.lyrics,
-            duration=request.duration,
-            language=request.language,
-            bpm=request.bpm,
-            key_scale=request.key_scale,
-            time_signature=request.time_signature,
-        )
+        cond = conditioner.build(resolved)
         timings["condition"] = time.time() - t0
     del conditioner
 
@@ -380,25 +442,25 @@ def generate(
     dit = None
     try:
         t0 = time.time()
-        dit = _load_dit(dit_snapshot, request.precision)
+        dit = _load_dit(dit_snapshot, resolved.precision)
         timings["load_dit"] = time.time() - t0
 
         result = mlx_generate_diffusion(
             mlx_decoder=dit,
             encoder_hidden_states_np=cond.encoder_hidden_states,
             context_latents_np=cond.context_latents,
-            src_latents_shape=(1, cond.latent_frames, LATENT_CHANNELS),
-            seed=request.seed,
-            infer_method=request.infer_method,
-            shift=settings.shift,
-            infer_steps=settings.steps,
-            guidance_scale=settings.guidance,
+            src_latents_shape=(1, resolved.latent_frames, LATENT_CHANNELS),
+            seed=resolved.seed,
+            infer_method=resolved.infer_method,
+            shift=resolved.shift,
+            infer_steps=resolved.steps,
+            guidance_scale=resolved.guidance,
             null_condition_emb_np=(
-                cond.null_condition_emb if settings.guidance > 1.0 else None
+                cond.null_condition_emb if resolved.guidance > 1.0 else None
             ),
-            sampler_mode=request.sampler,
-            dcw_enabled=settings.dcw,
-            compute_dtype=settings.compute_dtype,
+            sampler_mode=resolved.sampler,
+            dcw_enabled=resolved.dcw,
+            compute_dtype=resolved.compute_dtype,
             disable_tqdm=not progress,
         )
         timings.update(result["time_costs"])
@@ -430,9 +492,9 @@ def generate(
     return GenerationResult(
         audio=audio_np,
         sample_rate=SAMPLE_RATE,
-        seed=request.seed,
+        seed=resolved.seed,
         timings=timings,
-        tags=describe(spec, request, settings),
+        tags=describe(spec, resolved),
     )
 
 

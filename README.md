@@ -94,7 +94,7 @@ Useful options:
 | --- | --- | --- |
 | `-m, --model` | `xl-sft` | `xl-sft` (best) or `xl-turbo` (~6x faster) |
 | `-o, --out` | `song.flac` | Must end in `.flac` |
-| `-d, --duration` | `120` | Seconds, 10–600 |
+| `-d, --duration` | `120` | Seconds, 10–600, resolved onto the 40 ms latent grid |
 | `-s, --steps` | model default | 50 for sft, 8 for turbo |
 | `-g, --guidance` | `7.0` | CFG scale, 1.0 or above; 1.0 turns CFG off. Ignored by turbo, which is distilled |
 | `--seed` | random | Reuse to reproduce a take; 0 to 2^64-1 |
@@ -118,8 +118,12 @@ commit, because upstream force-pushes weights under the same ID), `AS15_SEED`,
 `AS15_DCW`, `AS15_PRECISION`, `AS15_DURATION`, `AS15_LANGUAGE`, plus `AS15_BPM`,
 `AS15_KEY` and `AS15_TIME_SIGNATURE` when you set them. Each is the value that
 actually ran rather than the one asked for, so a turbo take records
-`AS15_GUIDANCE=1` and not the 7 it ignored. None of them is a clock or a machine
-ID: the same command twice still writes byte-identical files.
+`AS15_GUIDANCE=1` and not the 7 it ignored, and `-d 12.9` records
+`AS15_DURATION=12.92` — the length of the audio, since the latent grid is 40 ms
+and that is the take the model was conditioned for. Every one of them still
+resolves back to itself, so a tag can go straight back on the command line.
+None is a clock or a machine ID: the same command twice still writes
+byte-identical files.
 
 No dependency does this. libsndfile sets ten fixed Vorbis fields and lyrics is not
 one of them, and every Python tagging library is either GPL (mutagen, pytaglib) or

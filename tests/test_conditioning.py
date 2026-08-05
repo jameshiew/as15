@@ -10,6 +10,7 @@ wrong-audio-shaped rather than crash-shaped -- the run succeeds either way.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +20,7 @@ import pytest
 import torch
 
 from as15 import conditioning, models
+from helpers import resolved
 
 # --- the trained text format ---------------------------------------------
 
@@ -41,13 +43,13 @@ def test_bool_assignment_saturates():
 
 
 def test_metas_block_format():
-    text = conditioning.format_metas(110, "C major", 4, 30.0)
+    text = conditioning.format_metas(110, "C major", 4, 30)
     assert text == (
         "- bpm: 110\n- timesignature: 4\n- keyscale: C major\n- duration: 30 seconds\n"
     )
     # Unset fields must render as N/A, not None or an empty string.
-    assert conditioning.format_metas(None, None, None, 12.7) == (
-        "- bpm: N/A\n- timesignature: N/A\n- keyscale: N/A\n- duration: 12 seconds\n"
+    assert conditioning.format_metas(None, None, None, 13) == (
+        "- bpm: N/A\n- timesignature: N/A\n- keyscale: N/A\n- duration: 13 seconds\n"
     )
 
 
@@ -97,7 +99,7 @@ def test_lyrics_the_encoder_cannot_read_are_rejected_not_truncated():
 
     with pytest.raises(conditioning.InputTooLong, match="lyric sheet"):
         _conditioner_with(tokenizer).build(
-            style_prompt="dream pop", lyrics="l" * 4000, duration=30.0
+            resolved(style_prompt="dream pop", lyrics="l" * 4000, duration=30.0)
         )
 
     assert tokenizer.calls, "the budget was checked without tokenising"
@@ -112,7 +114,7 @@ def test_a_style_prompt_the_encoder_cannot_read_is_rejected():
     """
     with pytest.raises(conditioning.InputTooLong, match="style prompt"):
         _conditioner_with(_CharTokenizer()).build(
-            style_prompt="p" * 400, lyrics="", duration=30.0
+            resolved(style_prompt="p" * 400, lyrics="", duration=30.0)
         )
 
 
@@ -243,13 +245,15 @@ def test_the_prompt_is_assembled_in_the_trained_format(tmp_path):
     """
     conditioner = _stub_conditioner(tmp_path)
     cond = conditioner.build(
-        style_prompt="dream pop, warm tape",
-        lyrics="[verse]\nCity lights",
-        duration=20.0,
-        language="fr",
-        bpm=110,
-        key_scale="C major",
-        time_signature=4,
+        resolved(
+            style_prompt="dream pop, warm tape",
+            lyrics="[verse]\nCity lights",
+            duration=20.0,
+            language="fr",
+            bpm=110,
+            key_scale="C major",
+            time_signature=4,
+        )
     )
 
     assert cond.text_prompt == (
@@ -276,7 +280,7 @@ def test_the_prompt_is_assembled_in_the_trained_format(tmp_path):
 def test_an_instruction_without_its_colon_gets_one(tmp_path):
     """The trained instruction ends in a colon; a caller's need not."""
     cond = _stub_conditioner(tmp_path).build(
-        style_prompt="x", lyrics="", duration=20.0, instruction="Write a song"
+        resolved(style_prompt="x", duration=20.0), instruction="Write a song"
     )
     assert "# Instruction\nWrite a song:\n" in cond.text_prompt
 
@@ -290,7 +294,7 @@ def test_the_context_block_is_the_silence_latent_beside_a_full_chunk_mask(tmp_pa
     off the wrong axis, leaves a tensor of exactly the right shape.
     """
     conditioner = _stub_conditioner(tmp_path)
-    cond = conditioner.build(style_prompt="x", lyrics="", duration=20.0)
+    cond = conditioner.build(resolved(style_prompt="x", duration=20.0))
 
     frames = 20 * models.LATENT_FPS
     assert cond.latent_frames == frames
@@ -311,7 +315,9 @@ def test_the_lyrics_take_the_embedding_table_and_the_caption_the_whole_stack(tmp
     """
     conditioner = _stub_conditioner(tmp_path)
     lyrics = "[verse]\nCity lights"
-    cond = conditioner.build(style_prompt="dream pop", lyrics=lyrics, duration=20.0)
+    cond = conditioner.build(
+        resolved(style_prompt="dream pop", lyrics=lyrics, duration=20.0)
+    )
 
     text_encoder = conditioner.text_encoder
     assert len(text_encoder.stack_calls) == 1
@@ -330,7 +336,7 @@ def test_the_condition_encoder_is_given_the_window_and_dtype_it_expects(tmp_path
     stage runs at the width it was loaded at.
     """
     conditioner = _stub_conditioner(tmp_path)
-    conditioner.build(style_prompt="x", lyrics="y", duration=20.0)
+    conditioner.build(resolved(style_prompt="x", lyrics="y", duration=20.0))
 
     kwargs = conditioner.encoder.kwargs
     refer = kwargs["refer_audio_acoustic_hidden_states_packed"]
@@ -354,7 +360,7 @@ def test_the_diffusion_loop_is_handed_float32_numpy(tmp_path):
     has to be widened on the way out -- ``np.array`` on a bf16 tensor raises
     rather than rounding, so this is a hard boundary rather than a preference.
     """
-    cond = _stub_conditioner(tmp_path).build(style_prompt="x", lyrics="", duration=20.0)
+    cond = _stub_conditioner(tmp_path).build(resolved(style_prompt="x", duration=20.0))
 
     for array in (
         cond.encoder_hidden_states,
@@ -368,21 +374,18 @@ def test_the_diffusion_loop_is_handed_float32_numpy(tmp_path):
     assert np.allclose(cond.null_condition_emb, 0.125)
 
 
-@pytest.mark.parametrize(
-    ("duration", "frames"),
-    [(20.0, 500), (0.0, 1), (0.01, 1), (20.04, 501)],
-)
-def test_the_latent_window_is_the_duration_at_the_latent_frame_rate(
-    tmp_path, duration, frames
-):
-    """Rounded, and never empty: a zero-frame latent has nothing to decode.
+@pytest.mark.parametrize("frames", [1, 501, 3000])
+def test_the_latent_window_is_the_frame_count_it_was_handed(tmp_path, frames):
+    """The window is sized from the resolved request, not from a duration.
 
-    ``resolve_settings`` rejects the short durations well before this, so the
-    floor is a second line rather than the only one -- but it is the one that
-    holds for a caller driving the Conditioner directly.
+    This stage used to take the duration in seconds and convert it itself,
+    which made it the second place the conversion happened -- and the two were
+    free to round differently. There is nothing to round here now: the frame
+    count arrives settled, and the window is that many frames or the
+    conditioning does not describe the take being generated.
     """
     cond = _stub_conditioner(tmp_path).build(
-        style_prompt="x", lyrics="", duration=duration
+        replace(resolved(style_prompt="x"), latent_frames=frames)
     )
     assert cond.latent_frames == frames
     assert cond.context_latents.shape[1] == frames

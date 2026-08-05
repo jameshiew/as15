@@ -18,7 +18,7 @@ from .pipeline import (
     GenerationRequest,
     check_output_path,
     generate,
-    resolve_settings,
+    resolve_request,
     write_audio,
 )
 
@@ -196,7 +196,7 @@ def sing(
     # Same for --out: what the write will insist on, asked before the run
     # rather than after it.
     try:
-        settings = resolve_settings(spec, request)
+        resolved = resolve_request(spec, request)
         check_output_path(out)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from None
@@ -218,12 +218,17 @@ def sing(
         )
 
     typer.secho(f"model     {spec.key}  ({spec.repo_id}@{spec.revision[:8]})", err=True)
+    # The resolved duration rather than the one typed: the latent grid is 40 ms,
+    # so `-d 12.9` is a 12.92 s take, and that is the length the metas block,
+    # the decode and the file's own AS15_DURATION all say too.
     typer.secho(
-        f"duration  {duration:g}s   steps {settings.steps}   seed {seed}", err=True
+        f"duration  {resolved.duration:g}s   steps {resolved.steps}   "
+        f"seed {resolved.seed}",
+        err=True,
     )
     typer.secho(
-        f"sampling  shift {settings.shift:g}   guidance {settings.guidance:g}   "
-        f"dcw {'on' if settings.dcw else 'off'}",
+        f"sampling  shift {resolved.shift:g}   guidance {resolved.guidance:g}   "
+        f"dcw {'on' if resolved.dcw else 'off'}",
         err=True,
     )
 

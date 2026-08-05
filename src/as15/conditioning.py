@@ -21,11 +21,15 @@ import gc
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
-from .models import latent_frames_for, shard_files
+from .models import shard_files
+
+if TYPE_CHECKING:
+    from .pipeline import ResolvedGenerationRequest
 
 # The CFG null branch's condition embedding, stored at the top level of the DiT
 # checkpoint. Read here and nowhere else: the converter used to copy it into
@@ -71,14 +75,21 @@ def format_metas(
     bpm: int | str | None,
     key_scale: str | None,
     time_signature: str | int | None,
-    duration: float,
+    duration: int,
 ) -> str:
-    """Render the ``# Metas`` block in the trained format."""
+    """Render the ``# Metas`` block in the trained format.
+
+    *duration* is whole seconds because that is what the block was trained in,
+    and it arrives already rounded rather than being rounded here: this used to
+    ``int()`` the request's duration, so a 12.9 s request told the model 12
+    while the latent window was sized for 12.92 -- the pacing the lyrics were
+    conditioned against was a song shorter than the one being generated.
+    """
     return (
         f"- bpm: {bpm or 'N/A'}\n"
         f"- timesignature: {time_signature or 'N/A'}\n"
         f"- keyscale: {key_scale or 'N/A'}\n"
-        f"- duration: {int(duration)} seconds\n"
+        f"- duration: {duration} seconds\n"
     )
 
 
@@ -209,21 +220,28 @@ class Conditioner:
     @torch.inference_mode()
     def build(
         self,
-        style_prompt: str,
-        lyrics: str,
-        duration: float,
-        language: str = "en",
-        bpm: int | str | None = None,
-        key_scale: str | None = None,
-        time_signature: str | int | None = None,
+        request: ResolvedGenerationRequest,
         instruction: str = DEFAULT_DIT_INSTRUCTION,
     ) -> Conditioning:
+        """Condition on *request*, which nothing here reinterprets.
+
+        A :class:`~as15.pipeline.ResolvedGenerationRequest` rather than the
+        fields it holds, because this stage and the diffusion loop have to be
+        told the same song: the length arrives as a frame count and a whole
+        number of seconds that the pipeline settled once, so there is no
+        duration left here to round differently from the one being generated.
+        """
         if not instruction.endswith(":"):
             instruction += ":"
 
-        metas = format_metas(bpm, key_scale, time_signature, duration)
-        text_prompt = SFT_GEN_PROMPT.format(instruction, style_prompt, metas)
-        lyrics_text = format_lyrics(lyrics, language)
+        metas = format_metas(
+            request.bpm,
+            request.key_scale,
+            request.time_signature,
+            request.metas_duration,
+        )
+        text_prompt = SFT_GEN_PROMPT.format(instruction, request.style_prompt, metas)
+        lyrics_text = format_lyrics(request.lyrics, request.language)
 
         # Tokenised without `truncation=True`, so that over-budget input can be
         # rejected below instead of quietly becoming a shorter song. For input
@@ -270,7 +288,7 @@ class Conditioner:
             refer_audio_order_mask=refer_order_mask,
         )
 
-        frames = latent_frames_for(duration)
+        frames = request.latent_frames
         src_latents = self.silence_slice(frames)
         chunk_masks = torch.full_like(src_latents, CHUNK_MASK_FULL)
         context_latents = torch.cat([src_latents, chunk_masks], dim=-1)
