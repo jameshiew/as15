@@ -19,8 +19,10 @@ from .models import (
     resolve,
 )
 from .pipeline import (
+    MAX_BPM,
     MAX_DURATION,
     MAX_SEED,
+    MIN_BPM,
     MIN_DURATION,
     OUTPUT_SUFFIX,
     GenerationRequest,
@@ -193,12 +195,19 @@ def sing(
     language: Annotated[
         str, typer.Option("--language", help="Vocal language code.")
     ] = "en",
-    bpm: Annotated[int | None, typer.Option("--bpm", help="Target tempo.")] = None,
+    bpm: Annotated[
+        int | None,
+        typer.Option("--bpm", help=f"Target tempo, {MIN_BPM} to {MAX_BPM}."),
+    ] = None,
     key: Annotated[
         str | None, typer.Option("--key", help="Key/scale, e.g. 'C major'.")
     ] = None,
     time_signature: Annotated[
-        int | None, typer.Option("--time-signature", help="2, 3, 4 or 6.")
+        int | None,
+        typer.Option(
+            "--time-signature",
+            help="Numerator on its own: 2, 3, 4 or 6 -- 3 for a waltz, 6 for 6/8.",
+        ),
     ] = None,
     sampler: Annotated[str, typer.Option("--sampler", help="euler or heun.")] = "euler",
     dcw: Annotated[

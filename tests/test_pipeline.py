@@ -167,14 +167,56 @@ def test_a_seed_outside_the_key_range_is_rejected(seed):
         mx.random.key(seed)
 
 
-@pytest.mark.parametrize("bpm", [0, -120, "0", "  "])
-def test_a_bpm_that_is_not_a_tempo_is_rejected(bpm):
-    """``bpm or 'N/A'`` renders 0 as *unset*; a negative one is written out."""
+# --- the musical metas ----------------------------------------------------
+#
+# Four values that are written down in three places -- the ``# Metas`` block the
+# DiT is conditioned on, the planner's reasoning block, and the file's own tags
+# -- and were checked in none of them. Whatever the request held was stringified
+# into each, so ``--bpm quickly`` conditioned on "quickly", ``"4.0"`` passed the
+# time-signature check as the number four and reached the block as ``4.0``, and
+# ``--key ""`` conditioned as N/A while the file recorded a key.
+
+
+@pytest.mark.parametrize("bpm", [0, -120, "0", "  ", "", "quickly", "4/4"])
+def test_a_bpm_that_names_no_tempo_is_rejected(bpm):
+    """``bpm or 'N/A'`` renders 0 as *unset*; the rest were written out.
+
+    A string that is not a number used to skip the check entirely -- it fell
+    out of ``_numeric`` as None, which the check read as "nothing to say" -- so
+    the text encoder was told the tempo was "quickly".
+    """
     with pytest.raises(ValueError, match="bpm"):
         pipeline.resolve_request(MODELS["xl-sft"], request(bpm=bpm))
 
 
-@pytest.mark.parametrize("time_signature", [5, 0, "4/4", "common"])
+@pytest.mark.parametrize("bpm", [float("inf"), float("nan"), 128.5, "128.5"])
+def test_a_bpm_the_metas_block_cannot_spell_is_rejected(bpm):
+    """``inf > 0`` is true, and the block has no spelling for half a beat."""
+    with pytest.raises(ValueError, match="bpm"):
+        pipeline.resolve_request(MODELS["xl-sft"], request(bpm=bpm))
+
+
+@pytest.mark.parametrize("bpm", [1, 29, 301, 10_000])
+def test_a_bpm_outside_the_range_a_tempo_lives_in_is_rejected(bpm):
+    """Neither a typo nor a sample rate is a tempo somebody meant."""
+    with pytest.raises(ValueError, match="bpm"):
+        pipeline.resolve_request(MODELS["xl-sft"], request(bpm=bpm))
+
+
+@pytest.mark.parametrize("bpm", [pipeline.MIN_BPM, pipeline.MAX_BPM, 96, "96", " 96 "])
+def test_a_tempo_becomes_the_integer_every_stage_writes_down(bpm):
+    """Ends included, and however it was spelled.
+
+    A request can be built from a config file as easily as from the CLI, so
+    ``"96"`` is the same tempo as ``96`` -- and had to become the same one
+    before three separate stringifications of it could agree.
+    """
+    resolved = pipeline.resolve_request(MODELS["xl-sft"], request(bpm=bpm))
+    assert resolved.bpm == int(str(bpm).strip())
+    assert isinstance(resolved.bpm, int)
+
+
+@pytest.mark.parametrize("time_signature", [5, 0, "4/4", "common", "", 4.5])
 def test_a_time_signature_the_metas_block_was_not_trained_on_is_rejected(
     time_signature,
 ):
@@ -185,9 +227,122 @@ def test_a_time_signature_the_metas_block_was_not_trained_on_is_rejected(
         )
 
 
-@pytest.mark.parametrize("time_signature", [2, 3, 4, 6, "4"])
-def test_the_documented_time_signatures_are_accepted(time_signature):
-    pipeline.resolve_request(MODELS["xl-sft"], request(time_signature=time_signature))
+@pytest.mark.parametrize(
+    ("time_signature", "expected"),
+    [(2, 2), (3, 3), (4, 4), (6, 6), ("4", 4), ("4.0", 4), (" 6 ", 6)],
+)
+def test_a_documented_time_signature_becomes_its_numerator(time_signature, expected):
+    """``"4.0"`` passed the old check as the number four and was written as 4.0.
+
+    The check read the value and the block was handed the spelling, so anything
+    that parsed as 4 conditioned the model on whatever characters it arrived as.
+    """
+    resolved = pipeline.resolve_request(
+        MODELS["xl-sft"], request(time_signature=time_signature)
+    )
+    assert resolved.time_signature == expected
+    assert isinstance(resolved.time_signature, int)
+
+
+@pytest.mark.parametrize("key_scale", ["", "   ", "\t"])
+def test_a_blank_key_is_unset_rather_than_a_key(key_scale):
+    """The block reads it as N/A -- ``key_scale or 'N/A'`` -- and always did.
+
+    What did not was ``describe``, which tests ``is not None`` and so wrote an
+    empty AS15_KEY beside conditioning that had been told there was no key.
+    """
+    resolved = pipeline.resolve_request(MODELS["xl-sft"], request(key_scale=key_scale))
+
+    assert resolved.key_scale is None
+    assert "AS15_KEY" not in pipeline.describe(MODELS["xl-sft"], resolved)
+    assert "keyscale: N/A" in conditioning.format_metas(None, None, None, 30)
+
+
+def test_a_key_is_stripped_before_it_is_conditioned_on():
+    resolved = pipeline.resolve_request(
+        MODELS["xl-sft"], request(key_scale=" C minor ")
+    )
+    assert resolved.key_scale == "C minor"
+
+
+@pytest.mark.parametrize("language", ["EN", " en ", "En\t"])
+def test_a_language_becomes_the_code_the_header_was_trained_with(language):
+    """`" en "` passed the blank check and went into the header with its spaces.
+
+    The header is ``# Languages\\n{}``, so the spaces were conditioned on;
+    lowercasing is so that ``EN`` and ``en`` are not two takes of one song.
+    """
+    resolved = pipeline.resolve_request(MODELS["xl-sft"], request(language=language))
+
+    assert resolved.language == "en"
+    assert conditioning.format_lyrics("", resolved.language).startswith(
+        "# Languages\nen\n"
+    )
+    assert pipeline.describe(MODELS["xl-sft"], resolved)["AS15_LANGUAGE"] == "en"
+
+
+@pytest.mark.parametrize("field", ["language", "key_scale"])
+def test_a_meta_that_would_break_its_block_is_rejected(field):
+    """These are written on one line of a block whose shape is trained.
+
+    A newline does not make a longer value, it makes a different block: the
+    metas after the key end up inside it, and a lyric sheet gains a second
+    ``# Languages`` header that the model reads as one.
+    """
+    with pytest.raises(ValueError, match=field):
+        pipeline.resolve_request(MODELS["xl-sft"], request(**{field: "en\n- bpm: 200"}))
+
+
+@pytest.mark.parametrize("style_prompt", ["", "   ", "\n"])
+def test_a_blank_style_prompt_is_rejected(style_prompt):
+    """It is the whole of the musical direction, and it was not checked at all."""
+    with pytest.raises(ValueError, match="style_prompt"):
+        pipeline.resolve_request(MODELS["xl-sft"], request(style_prompt=style_prompt))
+
+
+def test_a_style_prompt_is_stripped_before_it_is_conditioned_on():
+    """It sits in the ``# Caption`` block, so its whitespace is tokenised too."""
+    resolved = pipeline.resolve_request(
+        MODELS["xl-sft"], request(style_prompt="  dream pop  ")
+    )
+    assert resolved.style_prompt == "dream pop"
+    assert pipeline.describe(MODELS["xl-sft"], resolved)["DESCRIPTION"] == "dream pop"
+
+
+def test_the_metas_a_take_records_are_the_ones_it_was_conditioned_on():
+    """The tags are a recipe, so what is in them has to resolve back to itself.
+
+    Every spelling of a meta that reaches the block reaches the tags through
+    the same resolved value, and handing that value back produces it again.
+    """
+    spec = MODELS["xl-sft"]
+    resolved = pipeline.resolve_request(
+        spec, request(bpm="96", key_scale=" A minor ", time_signature="4.0")
+    )
+    tags = pipeline.describe(spec, resolved)
+
+    assert (tags["AS15_BPM"], tags["AS15_KEY"], tags["AS15_TIME_SIGNATURE"]) == (
+        "96",
+        "A minor",
+        "4",
+    )
+    again = pipeline.resolve_request(
+        spec,
+        request(
+            bpm=tags["AS15_BPM"],
+            key_scale=tags["AS15_KEY"],
+            time_signature=tags["AS15_TIME_SIGNATURE"],
+        ),
+    )
+    assert (again.bpm, again.key_scale, again.time_signature) == (96, "A minor", 4)
+    assert conditioning.format_metas(
+        again.bpm, again.key_scale, again.time_signature, again.metas_duration
+    ) == conditioning.format_metas(
+        resolved.bpm,
+        resolved.key_scale,
+        resolved.time_signature,
+        resolved.metas_duration,
+    )
 
 
 def test_settings_come_from_the_checkpoint_when_the_request_omits_them():

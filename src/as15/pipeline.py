@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import json
+import math
 import os
 import time
 from collections.abc import Iterator, Mapping, Sequence
@@ -139,6 +140,14 @@ MAX_DURATION = 600.0
 # The time signatures the metas block was trained with.
 VALID_TIME_SIGNATURES = (2, 3, 4, 6)
 
+# What the metas block will be read as a tempo. Nothing here is a hard musical
+# limit -- 30 is a very slow largo and 300 is past where anyone still counts
+# beats -- but outside them a number is not a tempo somebody meant: `--bpm 1`
+# and `--bpm 10000` are a typo and a sample rate, and both used to be written
+# into the conditioning verbatim for the text encoder to make what it could of.
+MIN_BPM = 30
+MAX_BPM = 300
+
 # ``mx.random.key`` takes a uint64: outside this range it raises TypeError out
 # of the binding, minutes into a run, with no mention of the seed.
 MAX_SEED = 2**64 - 1
@@ -160,15 +169,23 @@ class ResolvedGenerationRequest:
     Resolution happens once, here, and every stage downstream reads this: the
     banner, the conditioner, the diffusion loop and :func:`describe`. What is
     reported is what ran because there is nothing else left to report.
+
+    The musical metas are narrower here than on the request for the same reason:
+    a tempo may be *said* as ``120`` or ``"120"`` because a request can come from
+    a config file as easily as from the CLI, but by this point it is one integer,
+    and every stage that writes it down -- the metas block, the planner's
+    reasoning, the file's own tags -- writes the same characters.
     """
 
-    # What to generate.
+    # What to generate. Stripped, and blank where a value would be meaningless:
+    # an unset key and a blank one condition identically, so they are the same
+    # value here rather than two that ``describe`` then reports differently.
     style_prompt: str
     lyrics: str
     language: str
-    bpm: int | str | None
+    bpm: int | None
     key_scale: str | None
-    time_signature: str | int | None
+    time_signature: int | None
 
     # How long. Three numbers because the request's duration is not any of them:
     # *latent_frames* is what the DiT generates and the VAE decodes, *duration*
@@ -200,26 +217,51 @@ class ResolvedGenerationRequest:
     planned_by: str | None
 
 
-def _numeric(value: int | str | float) -> float | None:
-    """The number *value* denotes, or None if it is free text."""
+def _whole(value: int | str | float) -> int | None:
+    """The whole number *value* denotes, or None if it denotes none.
+
+    Spelling is not the point: ``4``, ``"4"`` and ``" 4.0 "`` all denote four,
+    and all three reach here because a request can be built from a config file
+    or a form as easily as from the CLI. The *value* is. ``"4/4"``, ``"quickly"``
+    and ``inf`` denote nothing the metas block can carry, and each of them used
+    to be written into it verbatim -- ``float("inf") > 0`` is true, and a
+    non-numeric string skipped the numeric check entirely.
+    """
+    if isinstance(value, int):
+        return value
     if isinstance(value, str):
         try:
-            return float(value)
+            value = float(value)
         except ValueError:
             return None
-    return float(value)
+    # Not an int and not parseable as a float: nothing that denotes a number.
+    if not isinstance(value, float):
+        return None
+    # A tempo of 128.5 is not one the metas block has a spelling for, and
+    # ``float('nan').is_integer()`` is False, so both fall out here.
+    return int(value) if math.isfinite(value) and value.is_integer() else None
 
 
-def _check_bpm(bpm: int | str | None) -> None:
+def _resolve_bpm(bpm: int | str | None) -> int | None:
+    """The tempo *bpm* names, as the integer the metas block is written with.
+
+    Raises:
+        ValueError: if it names no tempo, or one outside :data:`MIN_BPM` to
+            :data:`MAX_BPM`. Both used to pass: ``bpm or 'N/A'`` renders 0 as
+            *unset*, and everything else -- a negative tempo, an infinity, the
+            word "quickly" -- went into the conditioning as itself.
+    """
     if bpm is None:
-        return
-    if isinstance(bpm, str) and not bpm.strip():
-        raise ValueError("bpm must not be blank; leave it unset instead.")
-    value = _numeric(bpm)
-    # `bpm or 'N/A'` in the metas block renders 0 as *unset*, and a negative or
-    # non-finite tempo reaches the text encoder verbatim. Neither is a tempo.
-    if value is not None and not value > 0:
-        raise ValueError(f"bpm must be greater than zero, got {bpm!r}.")
+        return None
+    value = _whole(bpm)
+    if value is None:
+        raise ValueError(
+            f"bpm must be a whole number of beats per minute, got {bpm!r}. "
+            f"Leave it unset for N/A."
+        )
+    if not MIN_BPM <= value <= MAX_BPM:
+        raise ValueError(f"bpm must be between {MIN_BPM} and {MAX_BPM}, got {value}.")
+    return value
 
 
 def check_seed(seed: int | None) -> None:
@@ -234,15 +276,56 @@ def check_seed(seed: int | None) -> None:
         raise ValueError(f"seed must be between 0 and {MAX_SEED}, got {seed}.")
 
 
-def _check_time_signature(time_signature: str | int | None) -> None:
+def _resolve_time_signature(time_signature: str | int | None) -> int | None:
+    """The time signature *time_signature* names, as its numerator.
+
+    Raises:
+        ValueError: if the metas block was not trained on it. ``"4"`` used to
+            pass the check as the number four and then be written into the block
+            as the string it arrived as, which is the same characters; ``"4.0"``
+            passed the same way and was written as ``4.0``.
+    """
     if time_signature is None:
-        return
-    value = _numeric(time_signature)
+        return None
+    value = _whole(time_signature)
     if value not in VALID_TIME_SIGNATURES:
         allowed = ", ".join(str(t) for t in VALID_TIME_SIGNATURES)
         raise ValueError(
-            f"time_signature must be one of {allowed}, got {time_signature!r}."
+            f"time_signature must be one of {allowed} -- the numerator on its "
+            f"own, so 3 for a waltz and 6 for 6/8 -- got {time_signature!r}."
         )
+    return value
+
+
+def _one_line(what: str, value: str) -> str:
+    """*value* stripped, rejected if it would not fit the line it is written on.
+
+    Both fields this guards are written into a line of a block whose shape is
+    part of the trained prompt format: ``- keyscale: {}`` in the metas block, and
+    the ``# Languages`` header above the lyrics. A newline in either does not
+    make a longer value, it makes a different block -- the rest of the metas end
+    up inside the key, or the lyric sheet gains a header the model reads as one.
+    """
+    if "\n" in value or "\r" in value:
+        raise ValueError(f"{what} must be a single line, got {value!r}.")
+    return value.strip()
+
+
+def _resolve_key_scale(key_scale: str | None) -> str | None:
+    """The key *key_scale* names, or None where it names none.
+
+    Free text otherwise: the block takes whatever it is given, and which
+    spellings the model knows is not something this can rule on.
+
+    Raises:
+        ValueError: if it would break the metas block it is written into.
+    """
+    if key_scale is None:
+        return None
+    # Blank is unset rather than a value. The metas block already read it that
+    # way -- ``key_scale or 'N/A'`` -- while ``describe`` wrote an empty AS15_KEY
+    # beside it, so the file claimed a key that was never conditioned on.
+    return _one_line("key_scale", key_scale) or None
 
 
 def resolve_request(
@@ -288,11 +371,31 @@ def resolve_request(
 
     check_seed(request.seed)
 
-    if not request.language.strip():
+    # The musical metas are settled here rather than checked here: a bpm of
+    # ``"120"`` and one of ``120`` are the same tempo, and leaving them
+    # different meant the metas block, the planner's reasoning and the file's
+    # tags each stringified whatever they were handed. Free text is stripped
+    # for the same reason -- ``" en "`` passed the blank check and went into
+    # the trained ``# Languages`` header with its spaces still on.
+    #
+    # The lyrics are the one field left exactly as given: their line breaks are
+    # the structure the model reads, not whitespace around a value.
+    style_prompt = request.style_prompt.strip()
+    if not style_prompt:
+        raise ValueError(
+            "style_prompt must say what to generate; it is the whole of the "
+            "musical direction, and blank asks for nothing in particular."
+        )
+
+    # Lowercased because the header was trained in lowercase and because `EN`
+    # and `en` should not be two different takes of the same song.
+    language = _one_line("language", request.language).lower()
+    if not language:
         raise ValueError("language must be a code such as 'en', not blank.")
 
-    _check_bpm(request.bpm)
-    _check_time_signature(request.time_signature)
+    bpm = _resolve_bpm(request.bpm)
+    key_scale = _resolve_key_scale(request.key_scale)
+    time_signature = _resolve_time_signature(request.time_signature)
 
     # The duration collapses to a frame count here and is never interpreted
     # again: the latent grid is 40 ms, so the request's real number names a
@@ -324,12 +427,12 @@ def resolve_request(
         codes = codes[: codes_for_frames(frames)]
 
     return ResolvedGenerationRequest(
-        style_prompt=request.style_prompt,
+        style_prompt=style_prompt,
         lyrics=request.lyrics,
-        language=request.language,
-        bpm=request.bpm,
-        key_scale=request.key_scale,
-        time_signature=request.time_signature,
+        language=language,
+        bpm=bpm,
+        key_scale=key_scale,
+        time_signature=time_signature,
         latent_frames=frames,
         duration=duration,
         # Of the length being generated, not of the length asked for: a 12.9 s
@@ -406,7 +509,9 @@ def describe(spec: ModelSpec, request: ResolvedGenerationRequest) -> dict[str, s
 
     # The conditioning metas, which are only in the file if they were set: the
     # model is told "N/A" for an unset one, and recording that as a value would
-    # make an unset tempo indistinguishable from one deliberately given.
+    # make an unset tempo indistinguishable from one deliberately given. A blank
+    # one is already None by the time it gets here, so `--key ""` no longer
+    # writes an AS15_KEY that names no key.
     for name, value in (
         ("AS15_BPM", request.bpm),
         ("AS15_KEY", request.key_scale),

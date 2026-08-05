@@ -168,7 +168,7 @@ Useful options:
 | `-g, --guidance` | `7.0` | CFG scale, 1.0 or above; 1.0 turns CFG off. Ignored by turbo, which is distilled |
 | `--seed` | random | Reuse to reproduce a take; 0 to 2^64-1 |
 | `--takes` | `1` | Several takes of one song in one run, seeds counting up from `--seed` |
-| `--bpm`, `--key`, `--time-signature` | unset | Written into the conditioning metadata. Tempo above zero; time signature 2, 3, 4 or 6 |
+| `--bpm`, `--key`, `--time-signature` | unset | Written into the conditioning metadata. Tempo 30–300; time signature is the numerator alone — 2, 3, 4 or 6 |
 | `--dcw / --no-dcw` | per model | See above; leave alone unless experimenting |
 | `--precision` | `bf16` | `fp32` doubles memory for no measurable gain |
 
@@ -218,7 +218,10 @@ commit, because upstream force-pushes weights under the same ID), `AS15_SEED`,
 actually ran rather than the one asked for, so a turbo take records
 `AS15_GUIDANCE=1` and not the 7 it ignored, and `-d 12.9` records
 `AS15_DURATION=12.92` — the length of the audio, since the latent grid is 40 ms
-and that is the take the model was conditioned for. Every one of them still
+and that is the take the model was conditioned for. The musical metas are
+settled the same way, so `AS15_BPM` is the whole number the conditioning was
+given whichever way it was spelled, and a blank `--key` records nothing rather
+than a key with no name. Every one of them still
 resolves back to itself, so a tag can go straight back on the command line.
 None is a clock or a machine ID: the same command twice still writes
 byte-identical files.

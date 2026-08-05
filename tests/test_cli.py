@@ -31,8 +31,14 @@ CLI_REJECTS = [
     ["--seed=-1"],
     ["--model", "xl"],
     ["--bpm", "0"],
+    ["--bpm", "29"],
+    ["--bpm", "301"],
     ["--time-signature", "5"],
     ["--language", " "],
+    ["--language", "en\nfr"],
+    ["--key", "C major\n- bpm: 200"],
+    # Last one wins, so this is `sing` with a blank prompt.
+    ["--prompt", "   "],
     ["--out", "song.mp3"],
     ["--out", "song"],
 ]

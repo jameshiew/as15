@@ -86,18 +86,23 @@ CHUNK_MASK_FULL = 1.0
 
 
 def format_metas(
-    bpm: int | str | None,
+    bpm: int | None,
     key_scale: str | None,
-    time_signature: str | int | None,
+    time_signature: int | None,
     duration: int,
 ) -> str:
     """Render the ``# Metas`` block in the trained format.
 
-    *duration* is whole seconds because that is what the block was trained in,
-    and it arrives already rounded rather than being rounded here: this used to
+    Every value arrives settled -- see
+    :func:`~as15.pipeline.resolve_request` -- rather than being interpreted
+    here, because this is not the only place they are written down. *duration*
+    is whole seconds because that is what the block was trained in: this used to
     ``int()`` the request's duration, so a 12.9 s request told the model 12
-    while the latent window was sized for 12.92 -- the pacing the lyrics were
-    conditioned against was a song shorter than the one being generated.
+    while the latent window was sized for 12.92, and the pacing the lyrics were
+    conditioned against was a song shorter than the one being generated. The
+    metas are integers and stripped text for the same reason -- ``"4.0"`` was
+    accepted as a time signature and then written out as ``4.0``, and a blank
+    key rendered as ``N/A`` here while the file recorded it as a key.
     """
     return (
         f"- bpm: {bpm or 'N/A'}\n"

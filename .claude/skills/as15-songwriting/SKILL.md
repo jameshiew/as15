@@ -173,15 +173,21 @@ feel, say so.
 
 | Flag | Accepts | Notes |
 | --- | --- | --- |
-| `--bpm` | any number > 0 | slow 60--80, mid 90--120, fast 130--180 |
-| `--key` | free text | `"C major"`, `"A minor"`, `"F# minor"`. Common keys behave best |
+| `--bpm` | whole number, **30--300** | slow 60--80, mid 90--120, fast 130--180 |
+| `--key` | free text, one line | `"C major"`, `"A minor"`, `"F# minor"`. Common keys behave best |
 | `--time-signature` | **`2`, `3`, `4` or `6`** | A bare integer -- `3` for a waltz, **not** `"3/4"`. Anything else is rejected |
-| `--language` | code, default `en` | Written into the `# Languages` header; must match the lyrics |
+| `--language` | code, default `en` | Lowercased, written into the `# Languages` header; must match the lyrics |
 
 `--time-signature` is the one that catches people: it takes the numerator on its
 own rather than a `4/4`-style string, and the valid set is fixed at
 `(2, 3, 4, 6)` -- the signatures the metas block was trained with. Anything else
 is rejected before the run starts.
+
+All four are settled before anything loads: a tempo becomes a whole number, a
+blank `--key` is the same as leaving it off rather than a key with no name, and
+`--language` is stripped and lowercased. What the conditioning is told is what
+the file's `AS15_*` tags record, so a take's metas can be typed straight back
+in.
 
 Set `--bpm` when you need to match other material, when the genre is tempo-defined
 (house ~124, boom bap ~90, drum and bass ~174), or when the lyric density needs a
