@@ -1,6 +1,6 @@
 ---
 name: as15-songwriting
-description: Write and generate songs with as15 (ACE-Step 1.5 XL on MLX). Covers which genres the model renders well, style prompts, lyric sheets with structure tags, choosing duration/BPM/key/time signature, picking a checkpoint, planning with the 5Hz LM, and the draft-then-render loop. Use when the user wants to create, write, plan or generate a song in this repository.
+description: Write and generate songs with as15 (ACE-Step 1.5 XL on MLX). Covers settling the song before prompting, which genres the model renders well, style prompts, lyric sheets with structure tags, choosing duration/BPM/key/time signature, picking a checkpoint, planning with the 5Hz LM, the draft-then-render loop, choosing between takes, and fixing takes that come back wrong -- skipped lyrics, unrequested instruments, a chorus no bigger than the verse, harsh audio. Use when the user wants to create, write, plan, generate or troubleshoot a song in this repository.
 allowed-tools: Read, Write, Bash
 ---
 
@@ -34,6 +34,35 @@ is where takes belong.
 
 ---
 
+## 0. Settle the song before you touch a flag
+
+Answer these seven before writing anything as15 reads. Each one turns into a
+flag or a line of the sheet, and answering them separately is what stops you
+asking the model to invent the subject, the hook, the voice, the structure and
+the production all at once.
+
+| Question | Where the answer goes |
+| --- | --- |
+| What is the song about, in one sentence? | the lyric sheet |
+| What should the listener feel by the last chorus? | the energy arc in `-p` |
+| Genre and era? | `-p`, against §1's genre-fit table |
+| Whose voice, and how do they sing? | `-p` |
+| Which three to six instruments define it? | `-p` |
+| How do verse, pre-chorus, chorus and bridge differ? | `-p` and the section tags |
+| What is the section order? | the lyric sheet, and the arithmetic behind `-d` |
+
+"A sad love song" answers none of them. This does:
+
+> A nocturnal synth-pop song about realising, on the last train home, that a
+> finished relationship has stopped having a vote. Close, sparse verses that
+> open out into an optimistic chorus.
+
+That is a direction for the model *and* a criterion for you: when four takes
+come back you can say which one is the song, rather than which one is the
+cleanest audio.
+
+---
+
 ## 1. Style prompt (`-p`)
 
 The single biggest lever on what comes back. Comma-separated tags, a natural
@@ -49,6 +78,7 @@ detail onto one.
 | Texture | warm, crisp, airy, saturated, muddy, glassy, punchy |
 | Era / reference | 80s synth-pop, 90s boom bap, 2000s indie, vintage soul |
 | Production | analog tape, bedroom recording, studio-polished, heavily compressed, wide reverb |
+| Energy arc | sparse close verses, rising pre-chorus, wide layered chorus, half-time bridge |
 
 **Rules that are specific to as15:**
 
@@ -76,8 +106,23 @@ detail onto one.
    than naming it once.
 4. Reference tags ("in the style of 80s synthwave") carry a lot of aesthetic per
    token -- cheaper than enumerating the same thing instrument by instrument.
+   Name eras, scenes and traditions rather than artists: an artist's name is a
+   bet on what the model memorised of a catalogue you have no licence to, and
+   "brooding 80s synthwave, gated snare, arpeggiated bass" is the part you
+   actually wanted anyway.
 5. Keep the prompt and the lyric tags consistent. If the prompt says piano ballad,
    a `[guitar solo]` tag is a fight the output loses.
+6. **Describe audible decisions, not judgements.** "Epic, emotional, beautiful,
+   powerful, catchy, atmospheric" is how you would like the review to read;
+   nobody in a studio can act on it, and neither can the model. "Sparse
+   close-mic'd verses opening into wide layered choruses" is a set of
+   instructions. Every adjective should imply a decision someone had to make.
+7. **Say how the song moves, not only how it sounds.** A prompt that describes
+   one texture gets a take with that texture end to end -- the flattest failure
+   the model has, and the one users complain about most. Spend a clause on the
+   arc: "sparse verses build through rising pre-choruses into wide choruses;
+   brief half-time bridge". The section tags mark where; the prompt says by how
+   much.
 
 ### Genre fit
 
@@ -147,9 +192,17 @@ something to confirm by listening.
 
 - **6--10 syllables a line.** Lines in the same structural position should match
   within a syllable or two, so the model can settle into a meter.
+- **Repeat the chorus verbatim while you are drafting.** Identical words each
+  time is the only way to hear whether the model can land the same hook twice --
+  if the second chorus drifts, that is the model, not your rewrite. Vary the
+  final chorus, add ad-libs, change a line for the last repeat once the shape is
+  proven, not before.
 - **CAPITALS read as intensity.** `HOLD THE LINE` is shouted; `hold the line` is
   not. Use it on a hook, not a verse.
 - **Parentheses read as backing vocals**: `We rise again (again)`.
+- **Held vowels are unreliable.** `hoooold ooon` is a coin toss; write `hold on`
+  and let the melody hold it. Same for long runs of repeated letters anywhere in
+  a line.
 - **One breath per line.** If you cannot say it out loud in one go, it will not
   be sung in one either.
 - **One controlling metaphor per song**, explored from several angles. Water then
@@ -162,6 +215,22 @@ something to confirm by listening.
 
 Omit lyrics entirely. The CLI warns on stderr that it is generating an
 instrumental, and the FLAC gets no `LYRICS` tag. Put the arrangement in `-p`.
+
+Upstream's own guide offers a second form: a sheet of section tags and no words,
+as a map of an instrumental piece.
+
+```text
+[intro - ambient pads]
+[main theme - piano and restrained strings]
+[development - rising percussion]
+[climax - full orchestra]
+[outro - solo piano, fade out]
+```
+
+as15 passes that through as an ordinary lyric sheet -- it is not empty, so there
+is no instrumental warning and the FLAC does carry a `LYRICS` tag. Whether it
+buys you structure or gets the tags sung is a listening question; if a voice
+appears, fall back to empty lyrics and describe the arrangement in `-p`.
 
 ---
 
@@ -205,14 +274,14 @@ and verses go missing; too long and you get instrumental drift at the end.
 
 Rough section costs at 90--120 BPM in 4/4:
 
-| Section | Seconds |
-| --- | --- |
-| Intro / outro | 5--15 each |
-| Verse (8 lines) | 25--35 |
-| Pre-chorus (4 lines) | 12--18 |
-| Chorus (4--8 lines) | 20--30 |
-| Bridge | 15--25 |
-| Instrumental / solo | 10--20 |
+| Section | Bars | Seconds |
+| --- | --- | --- |
+| Intro / outro | 4--8 | 5--15 each |
+| Verse (8 lines) | 16 | 25--35 |
+| Pre-chorus (4 lines) | 4--8 | 12--18 |
+| Chorus (4--8 lines) | 8--12 | 20--30 |
+| Bridge | 8 | 15--25 |
+| Instrumental / solo | 4--8 | 10--20 |
 
 | Shape | Duration |
 | --- | --- |
@@ -224,6 +293,24 @@ Sanity check before generating: **sung lines x ~4 s, plus the instrumental
 sections.** If that exceeds `-d`, cut lines or raise the duration. Slower tempos
 need more seconds for the same words; faster ones fit more but still need air.
 When in doubt, go longer -- a song with room to breathe beats one that rushes.
+
+Once `--bpm` is set, count the arrangement in bars instead and the estimate stops
+being a guess:
+
+```text
+seconds = bars x beats-per-bar x 60 / bpm
+```
+
+96 bars of 4/4 at 112 BPM is `96 x 4 x 60 / 112` = 206 s, so ask for 205--215.
+The 4 s a line above is the same arithmetic with the bars left implicit -- about
+two bars a line at 120 BPM -- and it drifts once the tempo does. Round up: the
+sung sections are the ones that suffer when the container is tight, and the
+instrumental ones absorb the slack.
+
+Upstream calls two to four minutes the band where structure holds. Below it the
+form has nowhere to happen; well above it, expect repetition and drift late in
+the take, whatever the sheet says. The 600 s ceiling is what the CLI accepts, not
+a length worth aiming at.
 
 ---
 
@@ -262,9 +349,18 @@ two forward passes per step.)
 
 - `-g / --guidance` (sft only): 7.0 is the default. Lower (3--5) follows the
   prompt more loosely and often sounds more natural; higher is more literal and
-  can get brittle. `1.0` disables CFG and halves the cost.
+  can get brittle. `1.0` disables CFG and halves the cost. Upstream's own
+  documentation contradicts itself over which checkpoints take CFG at all -- the
+  model zoo says sft and base, the Gradio guide describes the field as base-only
+  -- so here the checkpoint decides and the table above is the answer. A recipe
+  from elsewhere quoting a guidance number for turbo is describing a surface that
+  is not this one.
 - `-s / --steps`: leave alone unless you are deliberately trading quality for
-  time. Below the checkpoint default, quality drops off quickly.
+  time. Below the checkpoint default, quality drops off quickly. Above it is
+  mostly folklore: turbo at 20 or 50 steps circulates as a fix for skipped words,
+  but it is unreplicated single-user reporting, it costs the 15x that made turbo
+  worth using, and 8 is the count the checkpoint was distilled for. Skipped words
+  are cheaper to fix in the sheet -- see §8.
 - `--sampler heun` evaluates the model twice per step for a second-order step --
   roughly double the diffusion time. Most worthwhile on 8-step turbo, where the
   step count is small enough that accuracy per step matters.
@@ -295,6 +391,14 @@ uv run as15 sing -p "..." -L lyrics.txt -d 180 --plan -o out/song.flac
 `--planner` picks the size: `0.6b`, `1.7b`, or `4b` (default, and upstream's own
 pick for quality). The planner is loaded and released before conditioning, so it
 does not raise the peak.
+
+Size buys long-tail knowledge rather than general polish. The 4B earns its 8.4 GB
+on unusual genres, uncommon instruments and dense arrangements -- the material a
+smaller model has thin coverage of. Upstream's own framing is that a bigger LM
+does *not* automatically improve ordinary pop or rock, and a four-on-the-floor
+house track is something all three have seen ten thousand times. So `1.7b` is
+worth an A/B on straightforward material rather than assumed to be worse; the
+comparison costs one plan each.
 
 The planner also **fills in metas you left unset** -- it settles a bpm, a key and
 a time signature and writes them into its reasoning block, which is printed on
@@ -331,8 +435,17 @@ Check it against the prompt before spending a render on it: the vocal, the
 instrumentation, and whether the structure it describes is the one your lyric
 tags asked for.
 
-Plans are worth keeping. Planning is one LM pass; rendering is fifty DiT passes,
-so write the plan once and render it several ways:
+Plans are worth keeping, and not only to save the time. The planner is most
+useful while the song is still vague -- it will settle a tempo, a key and an
+arrangement out of a thin brief, which is exactly the job you do not want to do
+yourself at that stage. It is least useful once your specification is precise,
+where a fresh `--plan` is one more opportunity to reinterpret a song you had
+already decided: a re-plan re-rolls the caption, and the caption is what moved
+the voice, the genre or the instrumentation last time. **Writing the plan to a
+file is how you stop asking.** Use the LM early, then freeze what it gave you.
+
+Planning is also one LM pass against fifty DiT passes, so write it once and
+render it several ways:
 
 ```bash
 uv run as15 plan -p "..." -L lyrics.txt -d 180 -o out/song.codes
@@ -391,6 +504,21 @@ the final take will have.
 
 3. **Listen, change one thing, regenerate.** Prompt wording, a lyric line, the
    duration. Same seed throughout.
+
+   Freezing the draw is what makes a comparison mean anything, and `--seed` is
+   not the only randomness in a planned run: either pin `--planner-seed` too, or
+   -- better -- render from a plan file so the LM does not run again at all.
+
+   | Comparisons worth making | Comparisons that teach you nothing |
+   | --- | --- |
+   | Same seed, one instrument changed in `-p` | A new prompt and a new seed |
+   | Same seed, one verse shortened | A prompt change and a duration change |
+   | Same seed and plan, `-g 5` against `-g 7` | A checkpoint change and a prompt change |
+   | Same plan, turbo against sft | A re-plan and anything else |
+   | Same everything, four consecutive seeds | Four takes of four different songs |
+
+   The right column is how most sessions actually go, and it is why they end
+   with a take nobody can reproduce and no idea which change earned it.
 4. **Explore takes** once the prompt is right. The seed is the whole difference
    between two takes of a settled song, so generate several at once:
 
@@ -402,6 +530,25 @@ the final take will have.
    sharing one conditioning pass and one load of each model rather than paying
    for four. Listen; keep the seed of the one that lands. A take is a function
    of its seed, so re-rendering that seed on its own gives the same audio back.
+
+   **Choose the song, not the cleanest audio.** Score each take 0--2 on seven
+   things and the choice stops being a vibe:
+
+   | Dimension | Question |
+   | --- | --- |
+   | Hook | Can you remember the chorus after one listen? |
+   | Form | Are the sections distinct, and in the order the sheet asked for? |
+   | Prosody | Do the words sit on the beat, or fight it? |
+   | Vocal | Convincing, and intelligible? |
+   | Groove | Do the drums and bass move on purpose? |
+   | Dynamics | Is the chorus genuinely bigger than the verse? |
+   | Audio | Clicks, clipping, hiss, harshness? |
+
+   Do not let the total decide on its own: a take that scored zero on Hook is
+   not a candidate however spotless the rest of it is. Polishing a strong
+   composition is ordinary work; rescuing a clean forgettable one is starting
+   again with extra steps. Audio is also the axis most likely to improve on its
+   own at step 5 -- see the measurements in the worked example.
 5. **Render on sft** with the seed and settings that worked:
 
    ```bash
@@ -459,10 +606,77 @@ uv run as15 download -m xl-sft
 
 ---
 
+## 8. When it comes back wrong
+
+Find the symptom, then work the right-hand column in the order it is written and
+stop when it is fixed. Almost none of these are sampler problems, and reaching
+for `-s` first is the most reliable way to spend fifteen minutes and learn
+nothing.
+
+| Symptom | What to change, in order |
+| --- | --- |
+| **Lines skipped, a verse missing, the bridge raced through** | Redo the §4 arithmetic -- a crammed container is far and away the commonest cause. Then shorten lines, even out syllables within a section, simplify the form, strip stacked tag modifiers, and draw four fresh seeds. Not more steps: skipping is reported at every step count there is, so no number of them guarantees delivery. |
+| **An instrument nobody asked for** | Read the plan's reasoning caption (§6) -- it usually named it first. Then cut the contradiction in `-p` that invited it and state a short positive palette. There is nowhere to put a negative: as15 has no negative prompt, CFG's unconditional branch is a stored null embedding rather than text you supply, so "no guitars" is just the word "guitars" in your caption. Re-plan, or drop `--plan` and see if it was the LM's idea. |
+| **The chorus is no bigger than the verse** | Put the arc in `-p` and not only in the tags (§1, rule 7): the model will happily render one texture for four minutes. Shorten the hook so it has room to open up, make the verse genuinely sparse in the writing, and expect to finish the contrast with a fader (§9). |
+| **Harsh, brittle, hissy, everything at one level** | Expected on a turbo draft. The measured draft below pinned its peak at 0.999 with 8.9 dB of range; sft from the same plan came back at 0.877 and 15.5 dB. Render on sft before treating it as a prompt problem. If it survives sft, audition more seeds, then fix it in the mix. |
+| **The planner changed the voice, the genre or the language** | §6, and it is the reason that section exists. Read the block, say the thing twice in different words, re-plan at a new seed. If it keeps drifting, drop `--plan`: the direct path cannot contradict you, having no opinion to contradict you with. |
+| **Vocals in something meant to be instrumental** | Empty lyrics is the reliable form; a tag-only sheet is not. Strip every vocal word from `-p` as well -- "female vocals", "topline", "choir", "sung" -- then draw more seeds. |
+| **Wrong language, or an accent you did not ask for** | `--language` has to match the words, and matching it is necessary rather than sufficient: upstream names multilingual lyric compliance as a standing limitation and English as the safe case. Non-English takes need more seeds and more listening; `zh_rap` is called out on the model card as its own weak spot. |
+| **The run refuses to start** | Read the message and believe it. Prompt over 256 tokens, lyrics over 2048, `--time-signature` outside `(2, 3, 4, 6)`, `--bpm` outside 30--300, output not `.flac`, or a plan with fewer codes than the duration needs. All of it is checked before a single weight loads, which is why a typo costs a second. |
+
+---
+
+## 9. After the render
+
+### What as15 will not do
+
+The model has more tasks than this CLI exposes. There is **no remix, cover,
+repaint, extend or reference-audio path here.** as15 implements the text-to-audio
+half only, and the audio-to-codes tokenizer the editing tasks need is never even
+built (`src/as15/conditioning.py`). Advice found elsewhere about Remix strength,
+Repaint windows or a reference track is describing upstream's Gradio and ComfyUI
+surfaces, not this one, and there is no flag here to map it onto.
+
+What there is instead: re-render the same plan at another seed, another
+guidance, or the other checkpoint. That gives you variations of one song rather
+than a transformation of a recording -- and for a section that will not come out
+right, it is regenerate-and-comp rather than repair in place.
+
+### Finish it outside the generator
+
+The complaints that recur about ACE-Step output are vocal expressiveness,
+dynamic contrast, drum transitions, groove and how memorable the melody is.
+Those are the hardest things to generate and none of them is a step count. as15
+writes 48 kHz stereo FLAC, which is a fine thing to import:
+
+- comp the best sections together -- takes rendered from one plan share an
+  arrangement, so they are the ones most likely to line up, but check both
+  boundaries by ear;
+- automate the verse-to-chorus level change the model under-plays;
+- reinforce or replace the drums, particularly transitions and fills;
+- de-ess, tame the harshness, clear the low end;
+- master last, once the arrangement has stopped moving.
+
+### Originality
+
+MIT covers this code and upstream's weights. It says nothing about anyone else's
+songs. Upstream's own guidance is to check output for originality, disclose that
+a track is AI-generated, and get permission for protected material used as a
+source or a reference -- which in practice means keeping artist names out of `-p`
+(§1) and existing lyrics out of the sheet.
+
+---
+
 ## Worked example
 
 "Hold the Morning" -- the canonical run: 4B plan, `xl-sft`, everything else at
 its default. Every number below was measured on it.
+
+**The spec** (§0), settled before anything else: a night nobody wants to end;
+defiance turning into euphoria by the last drop; contemporary soulful deep house;
+one warm female lead; Rhodes, sub bass, filtered pads, shuffled hats over a
+four-on-the-floor kick; sparse verse rising through a build into a wide drop,
+three times; the section order set out under **Duration** below.
 
 **Genre first.** The brief was only "something the model generates well", so §1's
 genre-fit table picked it: soulful deep house. Four-on-the-floor gives a 200 s
@@ -559,7 +773,9 @@ Lines run 6--8 syllables and stay parallel across the two verses. One metaphor -
 refusing the dawn -- from three angles. `[build]` into `[chorus - drop]` three
 times is the shape the genre already wants; the empty `[intro]` and `[breakdown]`
 are deliberate instrumental sections; `(not tonight)` is a backing vocal and the
-capitalised last chorus lifts it.
+capitalised last chorus lifts it. The first two choruses are word-for-word
+identical, which is what makes one listen enough to say whether the model can
+land the same hook twice; only the third departs from them.
 
 **Plan, and check it**
 
