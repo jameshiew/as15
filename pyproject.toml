@@ -10,6 +10,14 @@ dependencies = [
   "huggingface-hub>=1.0,<2",
   "mlx>=0.32.0",
   "numpy>=2.5.1",
+  # The 5Hz planner's reasoning block is YAML, in the exact shape upstream's
+  # `yaml.dump(..., sort_keys=True)` writes and the checkpoint was trained to
+  # read -- long captions folded across indented continuation lines and all.
+  # Emitting and parsing that by hand is a second implementation of someone
+  # else's format, in the one place where drifting from it produces a worse
+  # plan rather than an error. Already in the tree twice over (huggingface-hub
+  # and transformers both pull it in); declared because we import it.
+  "pyyaml>=6.0.3",
   "safetensors>=0.8.0",
   "soundfile>=0.14.0",
   "torch>=2.9.1",

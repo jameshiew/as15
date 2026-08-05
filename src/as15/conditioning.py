@@ -9,9 +9,11 @@ Using the checkpoint's own ``trust_remote_code`` modules here means the
 conditioning is bit-for-bit the reference implementation rather than a
 reimplementation that could silently drift.
 
-The FSQ ``tokenizer``/``detokenizer`` subtrees are deliberately never
-instantiated: they only matter for cover/audio-code tasks, and for
-text2music their output is discarded by ``torch.where(is_covers > 0, ...)``.
+Of the FSQ ``tokenizer``/``detokenizer`` subtrees, only the quantizer's
+codebook and the detokenizer are ever built, and only when a run supplies
+audio codes -- see :class:`AudioCodeDecoder`. The tokenizer's attention pooler
+is the half that turns *audio* into codes, which is the cover/extract task
+this package does not do.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from __future__ import annotations
 import copy
 import gc
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -26,6 +29,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from .codes import CODEBOOK_SIZE, POOL_WINDOW, check_codes
 from .models import shard_files
 
 if TYPE_CHECKING:
@@ -40,7 +44,17 @@ NULL_COND_KEY = "null_condition_emb"
 
 # Verbatim from acestep.constants -- these strings are part of the trained
 # prompt format, so they must not be paraphrased.
+#
+# Which of the two a run uses is decided by whether it has an audio-code plan,
+# not by anything the caller sets. Upstream reads the same way round: supplying
+# codes flips its task from ``text2music`` to ``cover``, and the task picks the
+# instruction (``TASK_INSTRUCTIONS`` in acestep.constants). Conditioning a
+# planned run on the mask-filling instruction would describe the job to the
+# text encoder as the one it is not doing.
 DEFAULT_DIT_INSTRUCTION = "Fill the audio semantic mask based on the given conditions:"
+AUDIO_CODE_DIT_INSTRUCTION = (
+    "Generate audio semantic tokens based on the given conditions:"
+)
 
 SFT_GEN_PROMPT = """# Instruction
 {}
@@ -139,6 +153,150 @@ class Conditioning:
     lyrics_text: str
 
 
+def _encoder_config(config):
+    """The config the encoder-side submodules are built from.
+
+    XL checkpoints size the condition encoder independently of the decoder, and
+    the FSQ tokenizer and detokenizer are built from that same encoder-sized
+    config upstream -- their ``hidden_size`` is ``encoder_hidden_size``, which
+    is also what ``fsq_dim`` is. Building either from the decoder's config
+    gives shapes the checkpoint's own weights will not load into.
+    """
+    encoder_config = copy.deepcopy(config)
+    encoder_config.hidden_size = config.encoder_hidden_size
+    encoder_config.intermediate_size = config.encoder_intermediate_size
+    encoder_config.num_attention_heads = config.encoder_num_attention_heads
+    encoder_config.num_key_value_heads = config.encoder_num_key_value_heads
+    return encoder_config
+
+
+class AudioCodeDecoder:
+    """Turns a 5 Hz audio-code plan into the 25 Hz latent hints the DiT reads.
+
+    The planner LM emits one FSQ index per 200 ms. Two checkpoint submodules
+    turn those back into something shaped like a latent: the residual-FSQ
+    codebook, which looks each index up and projects it to
+    ``encoder_hidden_size``, and the detokenizer, which expands every code into
+    ``pool_window_size`` frames and projects those down to the 64 acoustic
+    channels. The result replaces the silence that a text-only run conditions
+    on, and nothing else about the conditioning changes.
+
+    Only ``tokenizer.quantizer.*`` is loaded, not the whole audio tokenizer:
+    its attention pooler is the *encoding* direction -- audio to codes -- which
+    is the cover/extract task, and skipping it leaves 105 MB of weights on
+    disk. The two subtrees that are loaded come to ~105 M parameters.
+    """
+
+    def __init__(
+        self, snapshot: Path, config, dtype: torch.dtype, device: torch.device
+    ):
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+        from vector_quantize_pytorch import ResidualFSQ
+
+        self.device = device
+        self.dtype = dtype
+        # The plan's geometry is the runtime's contract -- a plan is parsed and
+        # bounds-checked by the CLI before any checkpoint is on disk -- so a
+        # checkpoint that disagrees is an error rather than a plan silently
+        # read at the wrong rate or against the wrong codebook.
+        self.pool_window = int(config.pool_window_size)
+        if self.pool_window != POOL_WINDOW:
+            raise RuntimeError(
+                f"checkpoint expands each audio code into {self.pool_window} "
+                f"latent frames, not {POOL_WINDOW}; plans are read at the wrong rate."
+            )
+
+        # The codebook stays float32. ResidualFSQ forces float32 through its FSQ
+        # layers internally and upstream's tokenizer casts around that; feeding
+        # it bf16 here would be casting into a module that casts straight back.
+        quantizer = ResidualFSQ(
+            dim=config.fsq_dim,
+            levels=list(config.fsq_input_levels),
+            num_quantizers=config.fsq_input_num_quantizers,
+        )
+        quantizer.load_state_dict(
+            _load_subtree(snapshot, "tokenizer.quantizer.", torch.float32), strict=True
+        )
+        self.quantizer = quantizer.to(device).eval()
+        if self.codebook_size != CODEBOOK_SIZE:
+            raise RuntimeError(
+                f"checkpoint codebook holds {self.codebook_size} codes, not "
+                f"{CODEBOOK_SIZE}; plans were bounds-checked against the wrong one."
+            )
+
+        remote_module = json.loads((snapshot / "config.json").read_text())["auto_map"][
+            "AutoModel"
+        ].split(".")[0]
+        detokenizer_cls = get_class_from_dynamic_module(
+            f"{remote_module}.AudioTokenDetokenizer", str(snapshot)
+        )
+        # On CPU rather than the meta device, for the same reason the condition
+        # encoder is: the rotary embedding's ``inv_freq`` is a non-persistent
+        # buffer, absent from the state dict and only ever set in __init__.
+        detokenizer = detokenizer_cls(config)
+        # ``assign=True`` for the same reason the condition encoder uses it:
+        # without it the loaded tensors are *copied into* the float32
+        # parameters the constructor made, so the module keeps float32 weights
+        # and meets its bfloat16 input in a matmul. On MPS that is not a
+        # promotion but an abort -- MPSNDArrayMatrixMultiplication asserts that
+        # destination and accumulator share a datatype, and the process dies
+        # with no Python traceback to say where.
+        detokenizer.load_state_dict(
+            _load_subtree(snapshot, "detokenizer.", dtype), assign=True, strict=True
+        )
+        self.detokenizer = detokenizer.to(device).eval()
+        # Said out loud, because the failure it guards is a process abort with
+        # no traceback rather than an exception anyone can catch.
+        loaded = next(self.detokenizer.parameters()).dtype
+        if loaded != dtype:
+            raise RuntimeError(
+                f"detokenizer weights loaded as {loaded}, not {dtype}; its input "
+                f"is {dtype} and the two meet in a matmul."
+            )
+
+    @property
+    def codebook_size(self) -> int:
+        """How many distinct codes the quantizer can look up.
+
+        Read off the built codebook rather than multiplied out of the config,
+        because it is the bound an index is actually checked against: the
+        planner's vocabulary carries 65535 ``<|audio_code_N|>`` tokens over a
+        codebook of 64000, so the tokens above the codebook exist and index
+        nothing.
+        """
+        return int(self.quantizer.codebooks.shape[-2])
+
+    @torch.inference_mode()
+    def hints(self, codes: Sequence[int], frames: int) -> torch.Tensor:
+        """The [1, *frames*, 64] latent hints *codes* stand for.
+
+        Raises:
+            ValueError: if a code is outside the codebook, or there are too few
+                to cover *frames*.
+        """
+        # Checked again here rather than trusted from the CLI, because this is
+        # the boundary where a bad index stops being data and starts being a
+        # lookup -- and against the codebook that was actually loaded.
+        check_codes(codes, frames, self.codebook_size, self.pool_window)
+
+        # [B, T, num_quantizers]: the residual-FSQ lookup indexes the quantizer
+        # on the last axis, and a bare [B, T] fails inside einx with a shape
+        # error naming neither the caller nor the argument.
+        index = torch.tensor(list(codes), dtype=torch.long, device=self.device).reshape(
+            1, -1, 1
+        )
+        hints_5hz = self.quantizer.get_output_from_indices(index)
+        hints = self.detokenizer(hints_5hz.to(self.dtype))
+        # Whole codes go in, so the expansion overshoots whenever the frame
+        # count is not a multiple of the pool window. Upstream crops the same
+        # way, to the length of the latents being generated.
+        return hints[:, :frames, :]
+
+    def release(self) -> None:
+        for name in ("quantizer", "detokenizer"):
+            self.__dict__.pop(name, None)
+
+
 def _pick_device(requested: str | None) -> torch.device:
     if requested and requested != "auto":
         return torch.device(requested)
@@ -171,12 +329,10 @@ class Conditioner:
 
         config = AutoConfig.from_pretrained(dit_snapshot, trust_remote_code=True)
 
-        # XL checkpoints size the encoder independently of the decoder.
-        encoder_config = copy.deepcopy(config)
-        encoder_config.hidden_size = config.encoder_hidden_size
-        encoder_config.intermediate_size = config.encoder_intermediate_size
-        encoder_config.num_attention_heads = config.encoder_num_attention_heads
-        encoder_config.num_key_value_heads = config.encoder_num_key_value_heads
+        encoder_config = _encoder_config(config)
+        # Kept for the audio-code decoder, which is built on demand from the
+        # same encoder-sized config rather than from the decoder's.
+        self.encoder_config = encoder_config
 
         encoder_cls = get_class_from_dynamic_module(
             f"{remote_module}.AceStepConditionEncoder", str(dit_snapshot)
@@ -187,7 +343,7 @@ class Conditioner:
         # would leave it uninitialised.
         encoder = encoder_cls(encoder_config)
         encoder.load_state_dict(
-            _load_encoder_state_dict(dit_snapshot, dtype), assign=True, strict=True
+            _load_subtree(dit_snapshot, "encoder.", dtype), assign=True, strict=True
         )
         self.encoder = encoder.to(self.device).eval()
 
@@ -221,7 +377,7 @@ class Conditioner:
     def build(
         self,
         request: ResolvedGenerationRequest,
-        instruction: str = DEFAULT_DIT_INSTRUCTION,
+        instruction: str | None = None,
     ) -> Conditioning:
         """Condition on *request*, which nothing here reinterprets.
 
@@ -230,7 +386,17 @@ class Conditioner:
         told the same song: the length arrives as a frame count and a whole
         number of seconds that the pipeline settled once, so there is no
         duration left here to round differently from the one being generated.
+
+        *instruction* defaults to the one the request's own shape calls for --
+        see :data:`AUDIO_CODE_DIT_INSTRUCTION` -- and is an argument only so a
+        caller experimenting with the trained prompt format can say so.
         """
+        if instruction is None:
+            instruction = (
+                AUDIO_CODE_DIT_INSTRUCTION
+                if request.audio_codes
+                else DEFAULT_DIT_INSTRUCTION
+            )
         if not instruction.endswith(":"):
             instruction += ":"
 
@@ -289,8 +455,17 @@ class Conditioner:
         )
 
         frames = request.latent_frames
-        src_latents = self.silence_slice(frames)
-        chunk_masks = torch.full_like(src_latents, CHUNK_MASK_FULL)
+        silence = self.silence_slice(frames)
+        # A text-only run conditions the context block on silence. An
+        # audio-code run replaces it with the plan's latent hints, and changes
+        # nothing else: the chunk mask still says "generate every frame", and
+        # the encoder hidden states above never saw the codes at all.
+        chunk_masks = torch.full_like(silence, CHUNK_MASK_FULL)
+
+        if request.audio_codes:
+            src_latents = self.audio_code_decoder().hints(request.audio_codes, frames)
+        else:
+            src_latents = silence
         context_latents = torch.cat([src_latents, chunk_masks], dim=-1)
 
         null_emb = _load_null_condition_emb(self.dit_snapshot)
@@ -303,6 +478,20 @@ class Conditioner:
             text_prompt=text_prompt,
             lyrics_text=lyrics_text,
         )
+
+    def audio_code_decoder(self) -> AudioCodeDecoder:
+        """The FSQ codebook and detokenizer, built on first use.
+
+        Not in ``__init__`` because a text-only run never needs them, and they
+        are ~105 M parameters loaded while the 4 B DiT is still to come.
+        """
+        decoder = self.__dict__.get("_audio_code_decoder")
+        if decoder is None:
+            decoder = AudioCodeDecoder(
+                self.dit_snapshot, self.encoder_config, self.dtype, self.device
+            )
+            self._audio_code_decoder = decoder
+        return decoder
 
     def __enter__(self) -> Conditioner:
         """Use as a context manager to bound the torch stage's lifetime.
@@ -326,6 +515,9 @@ class Conditioner:
         use-after-release raises an ``AttributeError`` naming the missing
         model, instead of ``NoneType is not callable`` from inside ``build``.
         """
+        decoder = self.__dict__.pop("_audio_code_decoder", None)
+        if decoder is not None:
+            decoder.release()
         for name in ("encoder", "text_encoder", "silence_latent"):
             self.__dict__.pop(name, None)
         # Collect before emptying the cache rather than after: a tensor whose
@@ -341,13 +533,13 @@ def _to_numpy(t: torch.Tensor) -> np.ndarray:
     return t.detach().to("cpu", torch.float32).numpy()
 
 
-def _load_encoder_state_dict(snapshot: Path, dtype: torch.dtype) -> dict:
-    """Read only the ``encoder.*`` tensors out of the checkpoint shards.
+def _load_subtree(snapshot: Path, prefix: str, dtype: torch.dtype) -> dict:
+    """Read the tensors under *prefix* out of the checkpoint shards.
 
-    Every shard is opened rather than only the ones the index lists encoder
-    weights in. ``safe_open`` reads a header, and ``keys()`` no tensor data,
-    so the shortcut saved nothing worth keeping a second copy of the shard
-    layout for -- and that copy was the one that handled both layouts.
+    Every shard is opened rather than only the ones the index lists the subtree
+    in. ``safe_open`` reads a header, and ``keys()`` no tensor data, so the
+    shortcut saved nothing worth keeping a second copy of the shard layout for
+    -- and that copy was the one that handled both layouts.
     """
     from safetensors.torch import safe_open
 
@@ -355,10 +547,10 @@ def _load_encoder_state_dict(snapshot: Path, dtype: torch.dtype) -> dict:
     for shard in shard_files(snapshot):
         with safe_open(shard, framework="pt") as f:
             for key in sorted(f.keys()):
-                if key.startswith("encoder."):
-                    state[key[len("encoder.") :]] = f.get_tensor(key).to(dtype)
+                if key.startswith(prefix):
+                    state[key[len(prefix) :]] = f.get_tensor(key).to(dtype)
     if not state:
-        raise RuntimeError(f"No encoder.* weights found in {snapshot}")
+        raise RuntimeError(f"No {prefix}* weights found in {snapshot}")
     return state
 
 

@@ -138,6 +138,70 @@ MODELS: dict[str, ModelSpec] = {
 DEFAULT_MODEL = "xl-sft"
 
 
+@dataclass(frozen=True)
+class PlannerSpec:
+    """A 5 Hz planner LM: the checkpoint that writes an audio-code plan.
+
+    All three sizes are Qwen3 over the same 217204-token vocabulary, whose tail
+    is 65535 ``<|audio_code_N|>`` tokens; they differ only in width and depth.
+    :class:`~as15.mlx.lm.MLXQwen3LM` runs any of them unchanged.
+    """
+
+    key: str
+    repo_id: str
+    revision: str
+    # Where the checkpoint sits inside the snapshot. The 1.7B is published as a
+    # directory of the shared base repo rather than a repo of its own, so it is
+    # the one that needs this.
+    subdir: str | None
+    gigabytes: float
+    description: str
+
+
+PLANNERS: dict[str, PlannerSpec] = {
+    "0.6b": PlannerSpec(
+        key="0.6b",
+        repo_id="ACE-Step/acestep-5Hz-lm-0.6B",
+        revision="148d8ea0225bdab342ee1ae3a354275ccd60ca80",
+        subdir=None,
+        gigabytes=1.2,
+        description="Qwen3-0.6B. Fastest; weakest at lyrics and structure.",
+    ),
+    "1.7b": PlannerSpec(
+        key="1.7b",
+        repo_id=BASE_REPO,
+        revision=BASE_REVISION,
+        subdir="acestep-5Hz-lm-1.7B",
+        gigabytes=3.4,
+        description="Qwen3-1.7B, shipped inside the base repo. The middle option.",
+    ),
+    "4b": PlannerSpec(
+        key="4b",
+        repo_id="ACE-Step/acestep-5Hz-lm-4B",
+        revision="0a3ec94b557aea7d508da38b31cfe7341f6ff737",
+        subdir=None,
+        gigabytes=8.4,
+        description="Qwen3-4B. Best plans -- upstream's own pick for quality.",
+    ),
+}
+
+DEFAULT_PLANNER = "4b"
+
+
+def resolve_planner(name: str) -> PlannerSpec:
+    """The registered planner called *name*.
+
+    Raises:
+        ValueError: If no planner goes by that name.
+    """
+    try:
+        return PLANNERS[name]
+    except KeyError:
+        raise ValueError(
+            f"Unknown planner {name!r}. Choose one of: {', '.join(PLANNERS)}"
+        ) from None
+
+
 def cache_root() -> Path:
     """Directory holding converted MLX weights."""
     env = os.environ.get("AS15_CACHE")

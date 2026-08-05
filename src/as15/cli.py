@@ -10,7 +10,14 @@ from typing import TYPE_CHECKING, Annotated
 import typer
 
 from .convert import PRECISIONS
-from .models import DEFAULT_MODEL, MODELS, ModelSpec, resolve
+from .models import (
+    DEFAULT_MODEL,
+    DEFAULT_PLANNER,
+    MODELS,
+    PLANNERS,
+    ModelSpec,
+    resolve,
+)
 from .pipeline import (
     MAX_DURATION,
     MIN_DURATION,
@@ -58,6 +65,23 @@ def _channels(audio: np.ndarray) -> str:
     """
     count = audio.shape[1] if audio.ndim > 1 else 1
     return {1: "mono", 2: "stereo"}.get(count, f"{count} channels")
+
+
+def _read_codes(path: Path | None) -> tuple[int, ...] | None:
+    """The plan in *path*, as a usage error when there is not one.
+
+    Read here rather than in the pipeline so a mistyped path or a file that
+    holds no plan costs a second, rather than surfacing after the checkpoints
+    have downloaded.
+    """
+    if path is None:
+        return None
+    from .codes import read_codes
+
+    try:
+        return read_codes(path)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
 
 
 def _read_lyrics(lyrics: str | None, lyrics_file: Path | None) -> str:
@@ -151,6 +175,38 @@ def sing(
     precision: Annotated[
         str, typer.Option("--precision", help=f"One of: {', '.join(PRECISIONS)}.")
     ] = "bf16",
+    plan: Annotated[
+        bool,
+        typer.Option(
+            "--plan/--no-plan",
+            help=(
+                "Sketch the song with the 5Hz planner LM first, and condition "
+                "on that instead of on silence. Slower, and downloads a second "
+                "checkpoint."
+            ),
+        ),
+    ] = False,
+    planner: Annotated[
+        str,
+        typer.Option(
+            "--planner", help=f"Planner for --plan. One of: {', '.join(PLANNERS)}."
+        ),
+    ] = DEFAULT_PLANNER,
+    planner_seed: Annotated[
+        int | None,
+        typer.Option(
+            "--planner-seed",
+            help="Seed for --plan. Defaults to --seed; pin it to keep one plan "
+            "while varying the render.",
+        ),
+    ] = None,
+    audio_codes: Annotated[
+        Path | None,
+        typer.Option(
+            "--audio-codes",
+            help="Condition on the plan in this file, as written by `as15 plan`.",
+        ),
+    ] = None,
     device: Annotated[
         str, typer.Option("--device", help="Torch device for conditioning.")
     ] = "auto",
@@ -173,6 +229,13 @@ def sing(
     if seed is None:
         seed = random.randint(0, 2**31 - 1)
 
+    if plan and audio_codes is not None:
+        raise typer.BadParameter(
+            "--plan writes a plan and --audio-codes supplies one; pass one or "
+            "the other."
+        )
+    codes = _read_codes(audio_codes)
+
     request = GenerationRequest(
         style_prompt=prompt,
         lyrics=lyrics_text,
@@ -188,6 +251,12 @@ def sing(
         sampler=sampler,
         dcw=dcw,
         precision=precision,
+        audio_codes=codes,
+        planner=planner if plan else None,
+        # One --seed reproduces the whole run, plan included. Pinning
+        # --planner-seed on its own keeps the plan while --seed moves the
+        # render, which is how you hear what the diffusion is contributing.
+        planner_seed=planner_seed if planner_seed is not None else seed,
     )
 
     # The same call generate() makes, so the banner below cannot report
@@ -231,6 +300,15 @@ def sing(
         f"dcw {'on' if resolved.dcw else 'off'}",
         err=True,
     )
+    if resolved.planner is not None:
+        chosen = PLANNERS[resolved.planner]
+        typer.secho(
+            f"planning  {chosen.key} ({chosen.gigabytes:g} GB)   "
+            f"seed {resolved.planner_seed}",
+            err=True,
+        )
+    elif resolved.audio_codes is not None:
+        typer.secho(f"plan      {len(resolved.audio_codes)} codes given", err=True)
 
     # Imported here rather than at the top of the module: as15.conditioning
     # pulls in torch, and `as15 models` should not pay for that.
@@ -283,6 +361,108 @@ def list_models() -> None:
             f"{key}{default}\n  {spec.description}\n"
             f"  {spec.repo_id}@{spec.revision[:8]}\n"
         )
+    typer.echo("5Hz planners (--plan --planner KEY):\n")
+    for key, planner in PLANNERS.items():
+        default = "  (default)" if key == DEFAULT_PLANNER else ""
+        location = f"{planner.repo_id}@{planner.revision[:8]}"
+        if planner.subdir:
+            location += f"  {planner.subdir}"
+        typer.echo(
+            f"{key}{default}\n  {planner.description}\n"
+            f"  {location}  ({planner.gigabytes:g} GB)\n"
+        )
+
+
+@app.command()
+def plan(
+    prompt: Annotated[
+        str, typer.Option("--prompt", "-p", help="Style prompt, as for `sing`.")
+    ],
+    lyrics: Annotated[
+        str | None, typer.Option("--lyrics", "-l", help="Lyrics as a string.")
+    ] = None,
+    lyrics_file: Annotated[
+        Path | None,
+        typer.Option("--lyrics-file", "-L", help="Read lyrics from a file, or '-'."),
+    ] = None,
+    out: Annotated[
+        Path, typer.Option("--out", "-o", help="Where to write the plan.")
+    ] = Path("plan.codes"),
+    duration: Annotated[
+        float,
+        typer.Option("--duration", "-d", min=MIN_DURATION, max=MAX_DURATION),
+    ] = 120.0,
+    planner: Annotated[
+        str, typer.Option("--planner", help=f"One of: {', '.join(PLANNERS)}.")
+    ] = DEFAULT_PLANNER,
+    seed: Annotated[
+        int | None, typer.Option("--seed", help="Random seed. Omit for random.")
+    ] = None,
+    language: Annotated[str, typer.Option("--language")] = "en",
+    bpm: Annotated[int | None, typer.Option("--bpm")] = None,
+    key: Annotated[str | None, typer.Option("--key")] = None,
+    time_signature: Annotated[int | None, typer.Option("--time-signature")] = None,
+    quiet: Annotated[bool, typer.Option("--quiet", "-q")] = False,
+) -> None:
+    """Write an audio-code plan without rendering it.
+
+    The same plan `sing --plan` writes, kept as a file so it can be rendered
+    more than once: at different guidance, with a different sampler, or against
+    the other checkpoint. Planning a two-minute song is one pass of the LM;
+    rendering it is fifty passes of a 4 B DiT, so separating them is what makes
+    trying six renders of one plan affordable.
+    """
+    from .models import latent_frames_for, resolve_planner
+    from .pipeline import planner_path
+
+    try:
+        spec = resolve_planner(planner)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
+
+    request = GenerationRequest(
+        style_prompt=prompt,
+        lyrics=_read_lyrics(lyrics, lyrics_file),
+        duration=duration,
+        language=language,
+        bpm=bpm,
+        key_scale=key,
+        time_signature=time_signature,
+        seed=seed,
+    )
+    try:
+        resolved = resolve_request(resolve(DEFAULT_MODEL), request)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
+
+    if seed is None:
+        seed = random.randint(0, 2**31 - 1)
+
+    from .codes import format_codes
+    from .planner import write_plan
+
+    typer.secho(f"planner   {spec.key} ({spec.gigabytes:g} GB)   seed {seed}", err=True)
+    written = write_plan(
+        planner_path(spec),
+        resolved,
+        latent_frames_for(duration),
+        seed,
+        progress=not quiet,
+    )
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    from .atomic import publish
+
+    publish(
+        out,
+        lambda tmp: tmp.write_text(format_codes(written.codes), encoding="utf-8"),
+    )
+    typer.secho(f"\n{written.reasoning}", err=True)
+    typer.secho(
+        f"wrote {out}  ({len(written.codes)} codes, {resolved.duration:g}s)",
+        fg=typer.colors.GREEN,
+        err=True,
+    )
 
 
 @app.command()

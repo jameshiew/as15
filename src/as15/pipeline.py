@@ -6,8 +6,8 @@ import gc
 import json
 import os
 import time
-from collections.abc import Mapping
-from dataclasses import dataclass, field
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import mlx.core as mx  # ty: ignore[unresolved-import]  (mlx ships no stubs)
@@ -15,6 +15,7 @@ import numpy as np
 
 from . import __version__
 from .atomic import publish
+from .codes import check_codes, codes_for_frames, format_codes
 from .convert import convert_dit, convert_vae, resolve_precision
 from .flac import set_comments
 from .mlx.sampler import check_guidance, check_sampling_options
@@ -30,6 +31,7 @@ from .models import (
     ensure_snapshot,
     latent_frames_for,
     load_dit_config,
+    resolve_planner,
     round_half_up,
     seconds_for,
 )
@@ -103,6 +105,18 @@ class GenerationRequest:
     infer_method: str = "ode"
     dcw: bool | None = None
     precision: str = "bf16"
+    # A 5 Hz audio-code plan to condition on, or None for the direct path.
+    # ``planner`` names a checkpoint to *write* one with (see PLANNERS); the
+    # pipeline runs it, fills ``audio_codes`` in and resolves again, so what
+    # generates is always a request whose plan is already settled.
+    audio_codes: Sequence[int] | None = None
+    planner: str | None = None
+    planner_seed: int | None = None
+    # Which planner wrote ``audio_codes``, when one did. Provenance, not a
+    # setting: the pipeline fills it in after planning, and nothing reads it
+    # back except the tags. A take is reproducible from the plan alone, but
+    # the plan does not say what wrote it.
+    planned_by: str | None = None
 
 
 @dataclass
@@ -174,6 +188,15 @@ class ResolvedGenerationRequest:
     dcw: bool
     precision: str
     compute_dtype: str
+
+    # What to condition the context block on. ``audio_codes`` is a settled plan
+    # -- checked here against the frame count, so the conditioner is never
+    # handed one too short for the song -- and ``planner`` is set only while a
+    # plan is still to be written.
+    audio_codes: tuple[int, ...] | None
+    planner: str | None
+    planner_seed: int | None
+    planned_by: str | None
 
 
 def _numeric(value: int | str | float) -> float | None:
@@ -266,6 +289,28 @@ def resolve_request(
     frames = latent_frames_for(request.duration)
     duration = seconds_for(frames)
 
+    if request.planner is not None:
+        resolve_planner(request.planner)
+    if request.planner is not None and request.audio_codes is not None:
+        raise ValueError(
+            "a run either conditions on the plan it is given or writes one, "
+            "not both; drop either the audio codes or the planner."
+        )
+    codes = None
+    if request.audio_codes is not None:
+        codes = tuple(request.audio_codes)
+        # Against the frame count rather than the requested duration: a plan
+        # covers whole 200 ms windows, and it is the frames that have to be
+        # covered. This runs for a plan the planner just wrote too, so an LM
+        # that stopped early is caught here rather than conditioning the last
+        # verse on silence.
+        check_codes(codes, frames)
+        # Cropped to what the song uses, for the same reason every other value
+        # here is resolved: the conditioner only ever reads the frames it is
+        # generating, so a longer plan would be recorded in the file as the
+        # recipe while a prefix of it was what actually ran.
+        codes = codes[: codes_for_frames(frames)]
+
     return ResolvedGenerationRequest(
         style_prompt=request.style_prompt,
         lyrics=request.lyrics,
@@ -288,6 +333,10 @@ def resolve_request(
         dcw=dcw,
         precision=request.precision,
         compute_dtype=compute_dtype,
+        audio_codes=codes,
+        planner=request.planner,
+        planner_seed=request.planner_seed,
+        planned_by=request.planned_by,
     )
 
 
@@ -353,6 +402,23 @@ def describe(spec: ModelSpec, request: ResolvedGenerationRequest) -> dict[str, s
     ):
         if value is not None:
             tags[name] = str(value)
+
+    # The plan, in full, in the form `--audio-codes` reads. It is the single
+    # largest thing separating this take from a text-only one and cannot be
+    # recovered from the audio, so recording a digest would leave the file
+    # describing a recipe it does not carry -- and a planned take could never
+    # be re-rendered at other settings. A two-minute plan is 600 codes, about
+    # 11 KB of comment against a ~20 MB master.
+    if request.audio_codes is not None:
+        tags["AS15_AUDIO_CODES"] = format_codes(request.audio_codes)
+        tags["AS15_AUDIO_CODE_COUNT"] = str(len(request.audio_codes))
+    # Only for a plan this run wrote. A plan that arrived in a file was written
+    # by something this take cannot vouch for, and naming a planner it did not
+    # run would be a worse claim than saying nothing.
+    if request.planned_by is not None:
+        tags["AS15_PLANNER"] = request.planned_by
+        if request.planner_seed is not None:
+            tags["AS15_PLANNER_SEED"] = str(request.planner_seed)
     return tags
 
 
@@ -362,6 +428,19 @@ def _resolve_snapshots(spec: ModelSpec) -> tuple[Snapshot, Snapshot]:
         BASE_REPO, BASE_REVISION, allow_patterns=BASE_PATTERNS
     )
     return dit_snapshot, base_snapshot
+
+
+def planner_path(spec) -> Path:
+    """Download the planner *spec* names and return the directory it lives in.
+
+    Only the planner's own files are fetched. The 1.7B is published as a
+    directory of the shared base repo rather than a repo of its own, so asking
+    for it without a pattern would pull the VAE, the text encoder and a second
+    DiT along with it.
+    """
+    patterns = [f"{spec.subdir}/*"] if spec.subdir else None
+    snapshot = ensure_snapshot(spec.repo_id, spec.revision, allow_patterns=patterns)
+    return snapshot.path / spec.subdir if spec.subdir else snapshot.path
 
 
 def _load_vae(base_snapshot: Snapshot):
@@ -417,6 +496,30 @@ def generate(
     # generate() in the same process would otherwise report whichever earlier
     # call -- or the weight conversion -- happened to allocate the most.
     mx.reset_peak_memory()
+
+    # --- Planning (MLX), released before anything else loads ---------------
+    #
+    # First because it is the largest single stage after the DiT -- the 4B
+    # planner is 8.4 GB -- and every later stage needs its plan. Resolving
+    # again with the plan filled in rather than patching it into the resolved
+    # request keeps resolution a pure function of the request, and puts the
+    # LM's own output through the same length check a supplied plan gets.
+    if resolved.planner is not None:
+        from .planner import write_plan
+
+        t0 = time.time()
+        plan = write_plan(
+            planner_path(resolve_planner(resolved.planner)),
+            resolved,
+            resolved.latent_frames,
+            resolved.planner_seed,
+            progress=progress,
+        )
+        timings["plan"] = time.time() - t0
+        request = replace(
+            request, audio_codes=plan.codes, planner=None, planned_by=plan.planner
+        )
+        resolved = resolve_request(spec, request)
 
     # --- Conditioning (PyTorch), released before the DiT is loaded ----------
     t0 = time.time()

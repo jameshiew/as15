@@ -225,7 +225,56 @@ whole workflow: iterate on turbo, render on sft.
 
 ---
 
-## 6. The loop
+## 6. Planning (`--plan`)
+
+By default the DiT starts from silence and writes the whole track from the
+prompt and lyrics alone. `--plan` runs the **5Hz planner LM** first: it sketches
+the song as one audio code per 200 ms and the DiT renders that sketch instead.
+
+```bash
+uv run as15 sing -p "..." -L lyrics.txt -d 180 --plan -o out/song.flac
+```
+
+| | Direct (default) | `--plan` |
+| --- | --- | --- |
+| Extra download | none | 1.2--8.4 GB, once |
+| Extra time | none | ~2 min for a 2-minute plan on the 4B |
+| Control | prompt and lyrics only | the plan also fixes the arrangement |
+
+`--planner` picks the size: `0.6b`, `1.7b`, or `4b` (default, and upstream's own
+pick for quality). The planner is loaded and released before conditioning, so it
+does not raise the peak.
+
+The planner also **fills in metas you left unset** -- it settles a bpm, a key and
+a time signature and writes them into its reasoning block, which is printed on
+stderr. Anything you set with `--bpm` / `--key` / `--time-signature` overrides
+it, and the duration is always yours. So `--plan` is a way to get a considered
+tempo and key rather than `N/A`, without having to pick them yourself.
+
+Plans are worth keeping. Planning is one LM pass; rendering is fifty DiT passes,
+so write the plan once and render it several ways:
+
+```bash
+uv run as15 plan -p "..." -L lyrics.txt -d 180 -o out/song.codes
+uv run as15 sing -p "..." -L lyrics.txt -d 180 --audio-codes out/song.codes -g 5 -o out/a.flac
+uv run as15 sing -p "..." -L lyrics.txt -d 180 --audio-codes out/song.codes -g 8 -o out/b.flac
+```
+
+The prompt, lyrics and duration passed to `sing` must be the ones the plan was
+written for -- the plan is a sketch *of that song*, and the DiT is still
+conditioned on the text as well. A plan shorter than the duration is rejected,
+naming how many codes are needed.
+
+Seeds: `--seed` covers the whole run, plan included. Pin `--planner-seed` on its
+own to keep one plan while `--seed` moves the render, which is how you hear what
+the diffusion is contributing on top of the sketch.
+
+Every planned take stores its plan in `AS15_AUDIO_CODES`, so a take can be
+re-rendered from the file it produced.
+
+---
+
+## 7. The loop
 
 1. **Plan.** Style prompt, structure, duration, metas. Write the lyric sheet to a
    file, e.g. `lyrics.txt` or `out/<name>.txt`.

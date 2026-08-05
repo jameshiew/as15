@@ -18,9 +18,9 @@ uv run as15 sing \
 The official [ACE-Step-1.5](https://github.com/ace-step/ACE-Step-1.5) repo works,
 but it is ~92k lines of Python and pulls in gradio, lightning, tensorboard, peft,
 numba, torchcodec, torchao, nano-vllm, modelscope and more. This is a single-purpose
-CLI: **11 runtime dependencies**, no web UI, no training code, no server.
+CLI: **12 runtime dependencies**, no web UI, no training code, no server.
 
-It also fixes three things that bite on Apple Silicon:
+It also fixes two things that bite on Apple Silicon:
 
 - **DCW is off by default for `xl-sft`.** Wavelet-domain correction was tuned for
   the distilled turbo models. Left on for the non-distilled checkpoints it makes
@@ -34,8 +34,60 @@ It also fixes three things that bite on Apple Silicon:
   exceeds Metal's 20.1 GB maximum buffer size and the run dies. `as15` decodes in
   overlapping windows — bit-identical output, flat ~7.3 GB regardless of length,
   so full-length songs work.
-- **No 5Hz LM.** The LM is a planner that invents lyrics and captions from a short
-  idea. If you are supplying both, it is 3.7 GB of weights doing nothing.
+## Planning
+
+By default the DiT is conditioned on silence: you give it words and a style, and
+it writes the whole track from those alone. That is the **direct path**, and it
+is what `as15 sing` does — one model, one pass, nothing else downloaded.
+
+There is a second path. ACE-Step also ships a **5Hz planner LM**, a Qwen3
+fine-tune whose vocabulary ends in 65535 audio-code tokens. Run first, it sketches
+the song as one code per 200 ms — a coarse map of how the track moves — and the
+DiT renders that instead of starting from nothing. Upstream calls this
+"thinking", and it is where their quality claims come from.
+
+```bash
+uv run as15 sing -p "dream pop, female vocals" -L lyrics.txt --plan
+```
+
+The planner runs entirely on MLX, like the DiT and the VAE, and is loaded and
+released before conditioning starts, so the peak is still whichever single stage
+is largest. Three sizes are available (`--planner`); the 4B is the default and
+upstream's own pick for quality.
+
+| Planner | Weights | Notes |
+| --- | --- | --- |
+| `0.6b` | 1.2 GB | Fastest. Weakest at lyrics and structure |
+| `1.7b` | 3.4 GB | Ships inside the base repo |
+| `4b` | 8.4 GB | Best plans; the default |
+
+A plan is worth keeping. Planning a two-minute song is one pass of the LM;
+rendering it is fifty passes of a 4B DiT, so `as15 plan` writes one to a file
+that `sing` can render as many times as you like — at different guidance, with
+the other sampler, against the other checkpoint:
+
+```bash
+uv run as15 plan -p "dream pop, female vocals" -L lyrics.txt -d 120 -o plan.codes
+uv run as15 sing -p "dream pop, female vocals" -L lyrics.txt -d 120 \
+  --audio-codes plan.codes -g 5 -o take1.flac
+```
+
+The file is a run of `<|audio_code_N|>` tokens, which is the only form every
+ACE-Step surface speaks — so a plan from upstream's CLI, web UI or HTTP API
+renders here, and one written here renders there. Every generated FLAC also
+carries its own plan in `AS15_AUDIO_CODES`, so a take can be re-rendered from
+the file it produced.
+
+One difference from upstream worth knowing when moving plans between the two:
+a plan too short for `-d` is **rejected here**, naming how many codes are
+needed. Upstream pads the shortfall with silence and says nothing, which returns
+a track whose last stretch quietly stops following the plan. A plan *longer*
+than the song is fine and is cropped — codes cover whole 200 ms windows, so any
+duration that is not a multiple of that has to overshoot.
+
+Planning is off by default. It is a second checkpoint to download, it adds a
+pass before every generation, and the direct path is the one that gets you a
+song from a cold cache in one download.
 
 ## Install
 

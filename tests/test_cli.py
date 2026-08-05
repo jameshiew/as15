@@ -279,3 +279,148 @@ def test_listing_the_models_names_the_commit_each_is_pinned_to():
     for key, spec in MODELS.items():
         assert key in result.output
         assert spec.revision[:8] in result.output
+
+
+# --- planning -------------------------------------------------------------
+
+
+def _plan_file(tmp_path, count: int):
+    from as15.codes import format_codes
+
+    path = tmp_path / "plan.codes"
+    path.write_text(format_codes(range(count)), encoding="utf-8")
+    return path
+
+
+def test_a_supplied_plan_reaches_the_request(monkeypatch, tmp_path):
+    seen: dict = {}
+    _stub_generate(monkeypatch, seen)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "sing",
+            "-p",
+            "x",
+            "-d",
+            "10",
+            "--audio-codes",
+            str(_plan_file(tmp_path, 50)),
+            "-o",
+            str(tmp_path / "a.flac"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["request"].audio_codes == tuple(range(50))
+    assert seen["request"].planner is None
+    assert "plan      50 codes given" in result.output
+
+
+def test_a_plan_file_that_holds_no_plan_is_a_usage_error(monkeypatch, tmp_path):
+    """Before the checkpoints download, not after."""
+
+    def unreachable(*args, **kwargs):
+        raise AssertionError("generate() ran")
+
+    monkeypatch.setattr(cli, "generate", unreachable)
+    path = tmp_path / "notes.txt"
+    path.write_text("some notes about the song", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        cli.app, ["sing", "-p", "x", "--audio-codes", str(path)]
+    )
+    assert result.exit_code != 0
+    assert "no audio codes found" in result.output
+
+
+def test_a_plan_too_short_for_the_song_is_a_usage_error(monkeypatch, tmp_path):
+    def unreachable(*args, **kwargs):
+        raise AssertionError("generate() ran")
+
+    monkeypatch.setattr(cli, "generate", unreachable)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "sing",
+            "-p",
+            "x",
+            "-d",
+            "120",
+            "--audio-codes",
+            str(_plan_file(tmp_path, 50)),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "needs 600" in result.output
+
+
+def test_writing_a_plan_and_supplying_one_together_is_rejected(monkeypatch, tmp_path):
+    def unreachable(*args, **kwargs):
+        raise AssertionError("generate() ran")
+
+    monkeypatch.setattr(cli, "generate", unreachable)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "sing",
+            "-p",
+            "x",
+            "-d",
+            "10",
+            "--plan",
+            "--audio-codes",
+            str(_plan_file(tmp_path, 50)),
+        ],
+    )
+    assert result.exit_code != 0
+
+
+def test_an_unknown_planner_is_rejected_before_anything_downloads(monkeypatch):
+    def unreachable(*args, **kwargs):
+        raise AssertionError("generate() ran")
+
+    monkeypatch.setattr(cli, "generate", unreachable)
+
+    result = CliRunner().invoke(
+        cli.app, ["sing", "-p", "x", "--plan", "--planner", "7b"]
+    )
+    assert result.exit_code != 0
+    assert "Unknown planner" in result.output
+
+
+def test_the_planner_seed_follows_the_run_seed_unless_pinned(monkeypatch, tmp_path):
+    """One --seed reproduces the whole run, plan included.
+
+    Pinning --planner-seed on its own is what keeps a plan fixed while --seed
+    moves the render, which is how you hear what the diffusion contributes.
+    """
+    seen: dict = {}
+    _stub_generate(monkeypatch, seen)
+    args = ["sing", "-p", "x", "-d", "10", "--plan", "-o", str(tmp_path / "a.flac")]
+
+    assert CliRunner().invoke(cli.app, [*args, "--seed", "5"]).exit_code == 0
+    assert seen["request"].planner_seed == 5
+
+    assert (
+        CliRunner()
+        .invoke(cli.app, [*args, "--seed", "5", "--planner-seed", "9"])
+        .exit_code
+        == 0
+    )
+    assert seen["request"].planner_seed == 9
+    assert seen["request"].seed == 5
+
+
+def test_the_banner_names_the_planner_and_what_it_costs(monkeypatch, tmp_path):
+    """The 4B is an 8.4 GB download, which is worth saying before it starts."""
+    _stub_generate(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["sing", "-p", "x", "-d", "10", "--plan", "-o", str(tmp_path / "a.flac")],
+    )
+    assert result.exit_code == 0, result.output
+    assert "planning  4b (8.4 GB)" in result.output
