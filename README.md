@@ -34,6 +34,7 @@ It also fixes two things that bite on Apple Silicon:
   exceeds Metal's 20.1 GB maximum buffer size and the run dies. `as15` decodes in
   overlapping windows — bit-identical output, flat ~7.3 GB regardless of length,
   so full-length songs work.
+
 ## Planning
 
 By default the DiT is conditioned on silence: you give it words and a style, and
@@ -224,14 +225,15 @@ uv run pytest -q
 ```
 
 These pin the invariants that produce correct-looking-but-wrong audio when
-broken: the trained prompt format and the context block built around it, the
+broken: the trained prompt formats and the context block built around them, the
 sampler's guidance and stepping, the compute dtype, the weight layouts and the
-cache identity. Four of them check a claim against something other than the
+cache identity. Five of them check a claim against something other than the
 current output — windowed decode against a whole-track decode, the MLX Haar
-transform against its filter bank, and a converted VAE and DiT against a numpy
-implementation of the published architecture. No checkpoint is downloaded and
-no real generation is run, so a change that could move the audio is still
-verified by generating.
+transform against its filter bank, a converted VAE against a numpy
+implementation of the published architecture, a converted DiT against the
+decoder its checkpoint was rendered from, and the planner LM against
+transformers' own Qwen3. No checkpoint is downloaded and no real generation is
+run, so a change that could move the audio is still verified by generating.
 
 The full gate suite -- ruff, tombi, ty, pytest -- is:
 

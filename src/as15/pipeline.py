@@ -36,8 +36,9 @@ from .models import (
     seconds_for,
 )
 
-# Only the files we actually use; skips the 3.7 GB 5Hz LM and the 2B turbo DiT
-# that also live in the shared base repo.
+# Only the files conditioning uses; skips the 2B turbo DiT and the 3.4 GB
+# 1.7B planner that also live in the shared base repo. A run that plans with
+# the 1.7B fetches it separately, in planner_path, with its own pattern.
 BASE_PATTERNS = ["vae/*", "Qwen3-Embedding-0.6B/*", "config.json"]
 
 # VAE decode allocates in proportion to output length: a 60 s decode peaks

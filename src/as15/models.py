@@ -11,7 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-# Shared assets: VAE + Qwen3 text encoder (+ the 5Hz LM, which we do not use).
+# Shared assets: VAE + Qwen3 text encoder. The 1.7B 5Hz planner also lives
+# here (see PLANNERS), fetched separately only when a run asks to plan.
 BASE_REPO = "ACE-Step/Ace-Step1.5"
 # Every repo is pinned to a commit. Upstream force-pushes weights under the same
 # repo ID, and a swapped checkpoint is silent -- it still generates audio, just

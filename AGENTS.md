@@ -19,9 +19,9 @@ failure. `just tidy` formats and autofixes first, then runs the same gates.
 Every one of those runs under `uv run` from the dev dependency group, so
 `uv sync` is the only setup -- do not reach for a globally installed tool.
 
-The tests do not cover generation. They do run models -- a reduced-width DiT
-and VAE, built in the test and compared against a reference -- but never a
-checkpoint, and nothing in them is an end-to-end generation. A change that
+The tests do not cover generation. They do run models -- a reduced-width DiT,
+VAE and planner LM, built in the test and compared against a reference -- but
+never a checkpoint, and nothing in them is an end-to-end generation. A change that
 could alter generated audio therefore still has to be verified by generating,
 and the commit message says how. Past commits have used: conditioning output compared
 bit-for-bit, reconverted weights compared by SHA-256, and a full regeneration

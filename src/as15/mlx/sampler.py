@@ -3,7 +3,7 @@
 # Replicates the timestep scheduling and ODE/SDE stepping from
 # ``AceStepConditionGenerationModel.generate_audio`` using pure MLX arrays.
 #
-# Sampler modes (see issue #957):
+# Sampler modes (see upstream issue #957):
 # - ``euler``: First-order Euler ODE/SDE step (default, original behaviour).
 # - ``heun``: Second-order Heun predictor-corrector -- evaluates the model
 #   twice per step and averages the predictions for higher accuracy, which
