@@ -167,9 +167,38 @@ Useful options:
 | `-s, --steps` | model default | 50 for sft, 8 for turbo |
 | `-g, --guidance` | `7.0` | CFG scale, 1.0 or above; 1.0 turns CFG off. Ignored by turbo, which is distilled |
 | `--seed` | random | Reuse to reproduce a take; 0 to 2^64-1 |
+| `--takes` | `1` | Several takes of one song in one run, seeds counting up from `--seed` |
 | `--bpm`, `--key`, `--time-signature` | unset | Written into the conditioning metadata. Tempo above zero; time signature 2, 3, 4 or 6 |
 | `--dcw / --no-dcw` | per model | See above; leave alone unless experimenting |
 | `--precision` | `bf16` | `fp32` doubles memory for no measurable gain |
+
+### Auditioning takes
+
+Which take of a song is the good one is a listening decision, and the seed is
+the whole difference between two of them. `--takes` generates a batch in one run:
+
+```bash
+uv run as15 sing -p "..." -L lyrics.txt -d 60 --seed 100 --takes 4
+```
+
+Seeds count up from `--seed`, and each take is written beside `--out` under its
+own name — `song-01-seed-100.flac` through `song-04-seed-103.flac` — so a batch
+sorts in the order it was generated and the seed to re-render is in the filename
+as well as the tags. One take, the default, still goes to `--out` itself.
+
+The takes share everything that is not their own diffusion: one conditioning
+pass, one DiT load, one VAE load, and one plan when `--plan` is on. Three 60 s
+turbo takes run in 57 s against 67 s as three commands, and two 15 s drafts in
+14 s against 26 s — the saving is a fixed ~15 s per process you do not start, so
+it is most of the wall clock when drafting and a smaller share of a full-length
+`xl-sft` render. Peak memory does not move: the phases are ordered so the DiT is
+released before the VAE loads, whether the batch is one take or ten.
+
+None of it changes the audio. A take is a function of its seed, so the third
+take of a batch is byte-identical to generating that seed on its own. Takes are
+written as they decode, so an interrupted batch keeps what it had finished, and
+one that cannot be written — a full disk, a decode that came back non-finite —
+is reported without taking the rest of the batch with it.
 
 ## What a take remembers
 

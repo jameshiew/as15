@@ -176,6 +176,24 @@ def test_an_unrelated_draw_between_two_sde_runs_does_not_move_the_result():
     assert np.array_equal(first, second)
 
 
+@pytest.mark.parametrize("infer_method", ["ode", "sde"])
+def test_a_take_is_the_same_wherever_it_falls_in_a_batch(infer_method):
+    """What makes a session's takes the same takes as separate runs.
+
+    ``GenerationSession`` generates several seeds back to back against one
+    loaded DiT, in one process. That is only the same thing as running the
+    command that many times if a take is a function of its seed alone -- if any
+    of the draw came off the implicit global stream, the third take of a batch
+    would be a different song from the third take of the same batch re-run
+    after listening to the first two.
+    """
+    alone = run_sampler(ConstantDecoder(), seed=11, infer_method=infer_method)
+    run_sampler(ConstantDecoder(), seed=10, infer_method=infer_method)
+    after = run_sampler(ConstantDecoder(), seed=11, infer_method=infer_method)
+
+    assert np.array_equal(alone["target_latents"], after["target_latents"])
+
+
 # --- what the loop refuses -----------------------------------------------
 
 

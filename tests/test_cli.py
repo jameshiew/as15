@@ -2,8 +2,8 @@
 
 Everything here is about failing in the first second rather than the fourth
 minute, and about the banner describing the run that is actually about to
-happen. ``generate`` is stubbed throughout: a regression that let a bad option
-through should fail the test, not spend a CI run downloading 19 GB.
+happen. The generation session is stubbed throughout: a regression that let a
+bad option through should fail the test, not spend a CI run downloading 19 GB.
 """
 
 from __future__ import annotations
@@ -38,36 +38,60 @@ CLI_REJECTS = [
 ]
 
 
-@pytest.mark.parametrize("argv", CLI_REJECTS, ids=lambda a: " ".join(a))
-def test_the_cli_rejects_unusable_options(argv, monkeypatch):
-    """Every one of these has to fail before generate() fetches ~10 GB.
-
-    generate() is stubbed to say so rather than to let a regression here spend
-    a CI run downloading a checkpoint.
-    """
+def _unreachable_session(monkeypatch, why: str = "a session was opened"):
+    """Fail loudly if ``sing`` gets as far as generating anything."""
 
     def unreachable(*args, **kwargs):
-        raise AssertionError(f"generate() ran for {argv}")
+        raise AssertionError(why)
 
-    monkeypatch.setattr(cli, "generate", unreachable)
+    monkeypatch.setattr(cli, "GenerationSession", unreachable)
+
+
+@pytest.mark.parametrize("argv", CLI_REJECTS, ids=lambda a: " ".join(a))
+def test_the_cli_rejects_unusable_options(argv, monkeypatch):
+    """Every one of these has to fail before a session fetches ~10 GB.
+
+    The session is stubbed to say so rather than to let a regression here spend
+    a CI run downloading a checkpoint.
+    """
+    _unreachable_session(monkeypatch, f"a session was opened for {argv}")
 
     result = CliRunner().invoke(cli.app, ["sing", "--prompt", "test", *argv])
     assert result.exit_code != 0
 
 
-def _stub_generate(monkeypatch, seen: dict | None = None):
-    """Let ``sing`` run to completion without a checkpoint."""
+def _stub_session(monkeypatch, seen: dict | None = None, write=None):
+    """Let ``sing`` run to completion without a checkpoint.
 
-    def fake_generate(spec, request, device="auto", progress=True):
-        if seen is not None:
-            seen["request"] = request
-            seen["progress"] = progress
-        return pipeline.GenerationResult(
-            audio=np.zeros((4, 2), dtype=np.float32), sample_rate=48_000, seed=0
-        )
+    The takes it hands back are silent and instant, but they arrive the way
+    real ones do -- one per seed, yielded in turn -- so the CLI's own loop is
+    the thing under test.
+    """
 
-    monkeypatch.setattr(cli, "generate", fake_generate)
-    monkeypatch.setattr(cli, "write_audio", lambda *args: None)
+    class FakeSession:
+        def __init__(self, spec, request, device="auto", progress=True):
+            if seen is not None:
+                seen["request"] = request
+                seen["progress"] = progress
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return None
+
+        def takes(self, seeds):
+            if seen is not None:
+                seen["seeds"] = list(seeds)
+            for seed in seeds:
+                yield pipeline.GenerationResult(
+                    audio=np.zeros((4, 2), dtype=np.float32),
+                    sample_rate=48_000,
+                    seed=seed,
+                )
+
+    monkeypatch.setattr(cli, "GenerationSession", FakeSession)
+    monkeypatch.setattr(cli, "write_audio", write or (lambda *args: None))
 
 
 def test_the_cli_accepts_the_smallest_valid_step_count(monkeypatch, tmp_path):
@@ -77,7 +101,7 @@ def test_the_cli_accepts_the_smallest_valid_step_count(monkeypatch, tmp_path):
     parses at all would fail those for the wrong reason.
     """
     seen: dict = {}
-    _stub_generate(monkeypatch, seen)
+    _stub_session(monkeypatch, seen)
 
     result = CliRunner().invoke(
         cli.app,
@@ -106,7 +130,7 @@ def test_the_banner_reports_the_settings_the_run_will_use(monkeypatch, tmp_path)
     are not the model's -- would describe a run nobody is about to make.
     """
     seen: dict = {}
-    _stub_generate(monkeypatch, seen)
+    _stub_session(monkeypatch, seen)
 
     result = CliRunner().invoke(
         cli.app, ["sing", "-p", "x", "-m", "xl-turbo", "-o", str(tmp_path / "a.flac")]
@@ -127,7 +151,7 @@ def test_the_banner_reports_the_duration_the_take_will_have(monkeypatch, tmp_pat
     nothing downstream used: the model was told 12 seconds, 12.92 was generated
     and 12.9 was printed and written into the file.
     """
-    _stub_generate(monkeypatch)
+    _stub_session(monkeypatch)
 
     result = CliRunner().invoke(
         cli.app, ["sing", "-p", "x", "-d", "12.9", "-o", str(tmp_path / "a.flac")]
@@ -144,7 +168,7 @@ def test_an_omitted_seed_is_chosen_and_reported(monkeypatch, tmp_path):
     would be unreproducible with nothing saying so.
     """
     seen: dict = {}
-    _stub_generate(monkeypatch, seen)
+    _stub_session(monkeypatch, seen)
 
     result = CliRunner().invoke(
         cli.app, ["sing", "-p", "x", "-o", str(tmp_path / "a.flac")]
@@ -158,7 +182,7 @@ def test_an_omitted_seed_is_chosen_and_reported(monkeypatch, tmp_path):
 
 def test_quiet_turns_off_the_progress_bar(monkeypatch, tmp_path):
     seen: dict = {}
-    _stub_generate(monkeypatch, seen)
+    _stub_session(monkeypatch, seen)
 
     CliRunner().invoke(cli.app, ["sing", "-p", "x", "-o", str(tmp_path / "a.flac")])
     assert seen["progress"] is True
@@ -176,7 +200,7 @@ def test_lyrics_come_from_a_file_or_stdin_or_neither(monkeypatch, tmp_path):
     a traceback under the banner.
     """
     seen: dict = {}
-    _stub_generate(monkeypatch, seen)
+    _stub_session(monkeypatch, seen)
     out = str(tmp_path / "a.flac")
 
     sheet = tmp_path / "lyrics.txt"
@@ -207,10 +231,23 @@ def test_the_cli_reports_input_it_cannot_condition_on(monkeypatch):
     has to land as an error rather than as a traceback.
     """
 
-    def too_long(*args, **kwargs):
-        raise conditioning.InputTooLong("the lyrics ... is 2200 tokens")
+    class TooLong:
+        def __init__(self, *args, **kwargs):
+            pass
 
-    monkeypatch.setattr(cli, "generate", too_long)
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return None
+
+        # A generator, like the real one, so this surfaces where it really does
+        # -- on the first take being asked for rather than on the call.
+        def takes(self, seeds):
+            raise conditioning.InputTooLong("the lyrics ... is 2200 tokens")
+            yield
+
+    monkeypatch.setattr(cli, "GenerationSession", TooLong)
     monkeypatch.setattr(cli, "write_audio", lambda *args: None)
 
     result = CliRunner().invoke(cli.app, ["sing", "-p", "x", "-l", "y"])
@@ -229,7 +266,7 @@ def test_a_write_that_fails_after_the_run_is_an_error_not_a_traceback(
     the run -- the disk filled, the directory went away -- and the message has
     to name the file rather than the internals.
     """
-    _stub_generate(monkeypatch)
+    _stub_session(monkeypatch)
     monkeypatch.setattr(
         cli,
         "write_audio",
@@ -252,12 +289,150 @@ def test_the_cli_says_it_is_about_to_overwrite_a_take(monkeypatch, tmp_path):
     """
     out = tmp_path / "song.flac"
     out.write_bytes(b"an earlier take")
-    _stub_generate(monkeypatch)
+    _stub_session(monkeypatch)
 
     result = CliRunner().invoke(cli.app, ["sing", "-p", "x", "-o", str(out)])
 
     assert result.exit_code == 0, result.output
     assert "will be overwritten" in result.stderr
+
+
+# --- more than one take ---------------------------------------------------
+#
+# Which take of a song is the good one is a listening decision, so the useful
+# unit of work is several of them. What the CLI owes that is a name per take, a
+# seed per take, and no run so brittle that one bad write loses the rest.
+
+
+def test_a_batch_counts_its_seeds_up_from_the_one_given(monkeypatch, tmp_path):
+    """Named by its first seed, so the whole batch is reproducible from it."""
+    seen: dict = {}
+    _stub_session(monkeypatch, seen)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "sing",
+            "-p",
+            "x",
+            "--seed",
+            "100",
+            "--takes",
+            "3",
+            "-o",
+            str(tmp_path / "a.flac"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["seeds"] == [100, 101, 102]
+    assert "seeds 100-102" in result.stderr
+
+
+def test_each_take_of_a_batch_gets_its_own_file(monkeypatch, tmp_path):
+    """Four takes into one path would leave the fourth and lose three."""
+    written: list[str] = []
+    _stub_session(monkeypatch, write=lambda path, *args: written.append(path.name))
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "sing",
+            "-p",
+            "x",
+            "--seed",
+            "7",
+            "--takes",
+            "3",
+            "-o",
+            str(tmp_path / "a.flac"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert written == ["a-01-seed-7.flac", "a-02-seed-8.flac", "a-03-seed-9.flac"]
+    for name in written:
+        assert f"wrote {tmp_path / name}" in result.stderr
+
+
+def test_a_single_take_is_still_written_where_it_was_asked_for(monkeypatch, tmp_path):
+    """The default run is unchanged: no index, no seed, no invented name."""
+    written: list[str] = []
+    _stub_session(monkeypatch, write=lambda path, *args: written.append(path.name))
+
+    result = CliRunner().invoke(
+        cli.app, ["sing", "-p", "x", "--seed", "7", "-o", str(tmp_path / "a.flac")]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert written == ["a.flac"]
+    assert "takes" not in result.stderr
+
+
+def test_every_take_of_a_batch_is_preflighted_before_the_first_one_runs(monkeypatch):
+    """A batch that cannot be written is a batch that should not be generated.
+
+    The check is on the derived names rather than on ``--out``, which is not
+    one of them.
+    """
+    _unreachable_session(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli.app, ["sing", "-p", "x", "--takes", "2", "-o", "song.mp3"]
+    )
+    assert result.exit_code != 0
+
+
+def test_a_batch_that_would_run_past_the_last_seed_is_rejected(monkeypatch):
+    """Counting up has an end, and reaching it minutes in would be a poor time."""
+    _unreachable_session(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["sing", "-p", "x", "--seed", str(pipeline.MAX_SEED), "--takes", "2"],
+    )
+    assert result.exit_code != 0
+    assert "largest seed" in result.output
+
+
+def test_one_take_that_cannot_be_written_does_not_take_the_batch_with_it(
+    monkeypatch, tmp_path
+):
+    """The takes behind a bad write are worth no less than the ones in front.
+
+    A batch is minutes of diffusion each; losing the lot to one full disk --
+    or to one decode that came back non-finite -- would be the expensive
+    failure mode.
+    """
+    written: list[str] = []
+
+    def write(path, *args):
+        if "02" in path.name:
+            raise OSError("no space left on device")
+        written.append(path.name)
+
+    _stub_session(monkeypatch, write=write)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "sing",
+            "-p",
+            "x",
+            "--seed",
+            "7",
+            "--takes",
+            "3",
+            "-o",
+            str(tmp_path / "a.flac"),
+        ],
+    )
+
+    assert written == ["a-01-seed-7.flac", "a-03-seed-9.flac"]
+    assert "Could not write" in result.stderr
+    # Reported as a failure even though two takes landed: a script that asked
+    # for three and got two should not read the run as having worked.
+    assert result.exit_code == 1
 
 
 @pytest.mark.parametrize(
@@ -294,7 +469,7 @@ def _plan_file(tmp_path, count: int):
 
 def test_a_supplied_plan_reaches_the_request(monkeypatch, tmp_path):
     seen: dict = {}
-    _stub_generate(monkeypatch, seen)
+    _stub_session(monkeypatch, seen)
 
     result = CliRunner().invoke(
         cli.app,
@@ -320,10 +495,7 @@ def test_a_supplied_plan_reaches_the_request(monkeypatch, tmp_path):
 def test_a_plan_file_that_holds_no_plan_is_a_usage_error(monkeypatch, tmp_path):
     """Before the checkpoints download, not after."""
 
-    def unreachable(*args, **kwargs):
-        raise AssertionError("generate() ran")
-
-    monkeypatch.setattr(cli, "generate", unreachable)
+    _unreachable_session(monkeypatch)
     path = tmp_path / "notes.txt"
     path.write_text("some notes about the song", encoding="utf-8")
 
@@ -335,10 +507,7 @@ def test_a_plan_file_that_holds_no_plan_is_a_usage_error(monkeypatch, tmp_path):
 
 
 def test_a_plan_too_short_for_the_song_is_a_usage_error(monkeypatch, tmp_path):
-    def unreachable(*args, **kwargs):
-        raise AssertionError("generate() ran")
-
-    monkeypatch.setattr(cli, "generate", unreachable)
+    _unreachable_session(monkeypatch)
 
     result = CliRunner().invoke(
         cli.app,
@@ -357,10 +526,7 @@ def test_a_plan_too_short_for_the_song_is_a_usage_error(monkeypatch, tmp_path):
 
 
 def test_writing_a_plan_and_supplying_one_together_is_rejected(monkeypatch, tmp_path):
-    def unreachable(*args, **kwargs):
-        raise AssertionError("generate() ran")
-
-    monkeypatch.setattr(cli, "generate", unreachable)
+    _unreachable_session(monkeypatch)
 
     result = CliRunner().invoke(
         cli.app,
@@ -379,10 +545,7 @@ def test_writing_a_plan_and_supplying_one_together_is_rejected(monkeypatch, tmp_
 
 
 def test_an_unknown_planner_is_rejected_before_anything_downloads(monkeypatch):
-    def unreachable(*args, **kwargs):
-        raise AssertionError("generate() ran")
-
-    monkeypatch.setattr(cli, "generate", unreachable)
+    _unreachable_session(monkeypatch)
 
     result = CliRunner().invoke(
         cli.app, ["sing", "-p", "x", "--plan", "--planner", "7b"]
@@ -398,7 +561,7 @@ def test_the_planner_seed_follows_the_run_seed_unless_pinned(monkeypatch, tmp_pa
     moves the render, which is how you hear what the diffusion contributes.
     """
     seen: dict = {}
-    _stub_generate(monkeypatch, seen)
+    _stub_session(monkeypatch, seen)
     args = ["sing", "-p", "x", "-d", "10", "--plan", "-o", str(tmp_path / "a.flac")]
 
     assert CliRunner().invoke(cli.app, [*args, "--seed", "5"]).exit_code == 0
@@ -416,7 +579,7 @@ def test_the_planner_seed_follows_the_run_seed_unless_pinned(monkeypatch, tmp_pa
 
 def test_the_banner_names_the_planner_and_what_it_costs(monkeypatch, tmp_path):
     """The 4B is an 8.4 GB download, which is worth saying before it starts."""
-    _stub_generate(monkeypatch)
+    _stub_session(monkeypatch)
 
     result = CliRunner().invoke(
         cli.app,

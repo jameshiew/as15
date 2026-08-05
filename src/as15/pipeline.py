@@ -6,7 +6,7 @@ import gc
 import json
 import os
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -222,6 +222,18 @@ def _check_bpm(bpm: int | str | None) -> None:
         raise ValueError(f"bpm must be greater than zero, got {bpm!r}.")
 
 
+def check_seed(seed: int | None) -> None:
+    """Reject a seed the diffusion loop cannot draw from.
+
+    ``mx.random.key`` takes a uint64: outside that range it raises TypeError out
+    of the binding, minutes into a run, with no mention of the seed. Shared by
+    :func:`resolve_request` and by :meth:`GenerationSession.takes`, which checks
+    every seed in a batch before the first one loads anything.
+    """
+    if seed is not None and not 0 <= seed <= MAX_SEED:
+        raise ValueError(f"seed must be between 0 and {MAX_SEED}, got {seed}.")
+
+
 def _check_time_signature(time_signature: str | int | None) -> None:
     if time_signature is None:
         return
@@ -274,8 +286,7 @@ def resolve_request(
         # forcing CFG on them doubles cost and degrades output.
         guidance = 1.0
 
-    if request.seed is not None and not 0 <= request.seed <= MAX_SEED:
-        raise ValueError(f"seed must be between 0 and {MAX_SEED}, got {request.seed}.")
+    check_seed(request.seed)
 
     if not request.language.strip():
         raise ValueError("language must be a code such as 'en', not blank.")
@@ -477,35 +488,133 @@ def _load_dit(dit_snapshot: Snapshot, precision: str):
     return dit
 
 
-def generate(
-    spec: ModelSpec,
-    request: GenerationRequest,
-    device: str = "auto",
-    progress: bool = True,
-) -> GenerationResult:
-    from .conditioning import Conditioner
-    from .mlx.sampler import mlx_generate_diffusion
+class GenerationSession:
+    """One song, several takes, with each model loaded exactly once.
 
-    # Reject a malformed request here rather than after the snapshots have been
-    # fetched and the conditioner has run, which is minutes in. Nothing below
-    # reads *request* again: every stage is handed the resolved one, so none of
-    # them can settle a default or a duration differently from the others.
-    resolved = resolve_request(spec, request)
-    timings: dict[str, float] = {}
+    A seed is the whole difference between two takes of the same song. The
+    prompt, the lyrics, the metas and the plan are identical; what moves is the
+    noise the diffusion starts from. Finding a song is therefore mostly a matter
+    of hearing a few of them and keeping one -- and running ``as15 sing`` that
+    many times is the wrong way to do it. Each run conditions the same words
+    again under torch, loads the same 8.3 GB of DiT weights again and loads the
+    VAE again, redoing about a minute of setup whose inputs did not move.
 
-    # The peak counter is process-global and never decays, so a second
-    # generate() in the same process would otherwise report whichever earlier
-    # call -- or the weight conversion -- happened to allocate the most.
-    mx.reset_peak_memory()
+    A session does each of those once, in the order a single generation was
+    already careful about, held across the whole batch rather than one take::
+
+        plan            -> release the planner
+        condition       -> release torch
+        load the DiT    -> every seed  -> release the DiT
+        load the VAE    -> every take  -> release the VAE
+
+    so the peak is still whichever single stage is largest, whether the batch is
+    one take or ten. What waits in between is the latents, at 3.8 MB each for a
+    ten-minute song -- three orders of magnitude under the models this avoids
+    reloading, which is what makes the phases orderable this way at all.
+
+    Takes are yielded as they decode rather than returned together, so a caller
+    writing them out holds one take's audio at a time. Ten minutes of stereo
+    float32 is 230 MB, and a batch of them would be a serious fraction of the
+    memory the rest of the run is arranged around.
+    """
+
+    def __init__(
+        self,
+        spec: ModelSpec,
+        request: GenerationRequest,
+        device: str = "auto",
+        progress: bool = True,
+    ):
+        # Resolved and thrown away: what it is for is the rejection. A request
+        # that cannot be honoured fails here, before the session has fetched a
+        # byte, rather than after the snapshots and the conditioner. Nothing
+        # below reads *request* again either -- every stage is handed a resolved
+        # one, so none of them can settle a default or a duration differently.
+        resolve_request(spec, request)
+
+        self.spec = spec
+        self.device = device
+        self.progress = progress
+        # What the batch as a whole cost: the stages that run once however many
+        # takes there are. Diffusion and decode are per take and ride on the
+        # takes themselves.
+        self.timings: dict[str, float] = {}
+
+        self._request = request
+        self._snapshots: tuple[Snapshot, Snapshot] | None = None
+        self._conditioning = None
+
+    def takes(self, seeds: Sequence[int | None]) -> Iterator[GenerationResult]:
+        """Generate one take per seed, yielding each as it finishes decoding.
+
+        The seeds are the only thing that differs between them; everything else
+        is the request the session was built with.
+
+        Raises:
+            ValueError: if a seed is outside the range the diffusion loop can
+                draw from. Every seed is checked before the first one runs, so a
+                batch cannot render three takes and then find the fourth
+                unusable.
+        """
+        seeds = list(seeds)
+        for seed in seeds:
+            check_seed(seed)
+        if not seeds:
+            return
+
+        # Process-global and never decaying, so it is reset per batch: a second
+        # batch would otherwise report whichever earlier one -- or the weight
+        # conversion -- happened to allocate the most.
+        mx.reset_peak_memory()
+
+        self._plan()
+        requests = [
+            resolve_request(self.spec, replace(self._request, seed=seed))
+            for seed in seeds
+        ]
+        # One conditioning for the batch, built from the first take because they
+        # are the same song: the seed reaches the diffusion loop and nothing
+        # else. Passing a resolved request rather than its fields is what keeps
+        # the window conditioned on and the window generated the same length.
+        cond = self._condition(requests[0])
+        latents = self._diffuse(requests, cond)
+        yield from self._decode(requests, latents)
+
+    def __enter__(self) -> GenerationSession:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Drop the conditioning the takes were generated against.
+
+        The models are released by the phases that load them, success or
+        failure; what a session goes on holding afterwards is the conditioning
+        -- around 8 MB for a ten-minute song, and stale the moment anything
+        about the request would change.
+        """
+        self._conditioning = None
 
     # --- Planning (MLX), released before anything else loads ---------------
-    #
-    # First because it is the largest single stage after the DiT -- the 4B
-    # planner is 8.4 GB -- and every later stage needs its plan. Resolving
-    # again with the plan filled in rather than patching it into the resolved
-    # request keeps resolution a pure function of the request, and puts the
-    # LM's own output through the same length check a supplied plan gets.
-    if resolved.planner is not None:
+
+    def _plan(self) -> None:
+        """Write the audio-code plan, once for the batch, if one was asked for.
+
+        First because it is the largest single stage after the DiT -- the 4B
+        planner is 8.4 GB -- and every later stage needs its plan. Once for the
+        batch because a plan is a property of the song rather than of a take:
+        holding it fixed while the seed moves is what makes a batch a comparison
+        of renders rather than of arrangements.
+
+        The plan goes back into the *request* and is resolved again, rather than
+        being patched into the resolved one, so resolution stays a pure function
+        of the request and the LM's own output goes through the same length
+        check a supplied plan gets.
+        """
+        resolved = self._resolve()
+        if resolved.planner is None:
+            return
         from .planner import write_plan
 
         t0 = time.time()
@@ -514,92 +623,142 @@ def generate(
             resolved,
             resolved.latent_frames,
             resolved.planner_seed,
-            progress=progress,
+            progress=self.progress,
         )
-        timings["plan"] = time.time() - t0
-        request = replace(
-            request, audio_codes=plan.codes, planner=None, planned_by=plan.planner
+        self.timings["plan"] = time.time() - t0
+        self._request = replace(
+            self._request,
+            audio_codes=plan.codes,
+            planner=None,
+            planned_by=plan.planner,
         )
-        resolved = resolve_request(spec, request)
 
-    # --- Conditioning (PyTorch), released before the DiT is loaded ----------
-    t0 = time.time()
-    dit_snapshot, base_snapshot = _resolve_snapshots(spec)
-    timings["resolve"] = time.time() - t0
+    def _resolve(self) -> ResolvedGenerationRequest:
+        return resolve_request(self.spec, self._request)
 
-    t0 = time.time()
-    conditioner = Conditioner(dit_snapshot.path, base_snapshot.path, device=device)
-    timings["load_conditioner"] = time.time() - t0
+    def _snapshot_pair(self) -> tuple[Snapshot, Snapshot]:
+        if self._snapshots is None:
+            t0 = time.time()
+            self._snapshots = _resolve_snapshots(self.spec)
+            self.timings["resolve"] = time.time() - t0
+        return self._snapshots
 
-    # Every stage from here on hands its memory back on the way out, failure
-    # included. Only the successful path used to, which is enough for the CLI
-    # -- the process exits either way -- but leaves a caller that catches the
-    # failure and retries holding the whole dead attempt, so the retry dies of
-    # an out-of-memory naming some entirely different stage.
-    t0 = time.time()
-    with conditioner:
-        cond = conditioner.build(resolved)
-        timings["condition"] = time.time() - t0
-    del conditioner
+    # --- Conditioning (PyTorch), released before the DiT is loaded ---------
+
+    def _condition(self, resolved: ResolvedGenerationRequest):
+        from .conditioning import Conditioner
+
+        if self._conditioning is not None:
+            return self._conditioning
+        dit_snapshot, base_snapshot = self._snapshot_pair()
+
+        t0 = time.time()
+        conditioner = Conditioner(
+            dit_snapshot.path, base_snapshot.path, device=self.device
+        )
+        self.timings["load_conditioner"] = time.time() - t0
+
+        # Every stage from here on hands its memory back on the way out, failure
+        # included. Only the successful path used to, which is enough for the
+        # CLI -- the process exits either way -- but leaves a caller that
+        # catches the failure and retries holding the whole dead attempt, so the
+        # retry dies of an out-of-memory naming some entirely different stage.
+        t0 = time.time()
+        with conditioner:
+            self._conditioning = conditioner.build(resolved)
+            self.timings["condition"] = time.time() - t0
+        return self._conditioning
 
     # --- Diffusion (MLX) ---------------------------------------------------
-    dit = None
-    try:
-        t0 = time.time()
-        dit = _load_dit(dit_snapshot, resolved.precision)
-        timings["load_dit"] = time.time() - t0
 
-        result = mlx_generate_diffusion(
-            mlx_decoder=dit,
-            encoder_hidden_states_np=cond.encoder_hidden_states,
-            context_latents_np=cond.context_latents,
-            src_latents_shape=(1, resolved.latent_frames, LATENT_CHANNELS),
-            seed=resolved.seed,
-            infer_method=resolved.infer_method,
-            shift=resolved.shift,
-            infer_steps=resolved.steps,
-            guidance_scale=resolved.guidance,
-            null_condition_emb_np=(
-                cond.null_condition_emb if resolved.guidance > 1.0 else None
-            ),
-            sampler_mode=resolved.sampler,
-            dcw_enabled=resolved.dcw,
-            compute_dtype=resolved.compute_dtype,
-            disable_tqdm=not progress,
-        )
-        timings.update(result["time_costs"])
-        latents = result["target_latents"]
-    finally:
-        # Same ordering argument as Conditioner.release(): collect first so
-        # that every dead array has returned its buffer to MLX's cache, then
-        # clear the cache so the buffers go back to the OS.
-        del dit
-        gc.collect()
-        mx.clear_cache()
+    def _diffuse(
+        self, requests: Sequence[ResolvedGenerationRequest], cond
+    ) -> list[tuple[np.ndarray, dict[str, float]]]:
+        """Run every take's diffusion loop against one loaded DiT.
+
+        All of them before any decoding, because the DiT and the VAE must not be
+        resident together: interleaving would either reload one of them per take
+        or hold both, and holding both is what the whole ordering exists to
+        avoid.
+        """
+        from .mlx.sampler import mlx_generate_diffusion
+
+        dit = None
+        drawn: list[tuple[np.ndarray, dict[str, float]]] = []
+        try:
+            t0 = time.time()
+            dit = _load_dit(self._snapshot_pair()[0], requests[0].precision)
+            self.timings["load_dit"] = time.time() - t0
+
+            for resolved in requests:
+                result = mlx_generate_diffusion(
+                    mlx_decoder=dit,
+                    encoder_hidden_states_np=cond.encoder_hidden_states,
+                    context_latents_np=cond.context_latents,
+                    src_latents_shape=(1, resolved.latent_frames, LATENT_CHANNELS),
+                    seed=resolved.seed,
+                    infer_method=resolved.infer_method,
+                    shift=resolved.shift,
+                    infer_steps=resolved.steps,
+                    guidance_scale=resolved.guidance,
+                    null_condition_emb_np=(
+                        cond.null_condition_emb if resolved.guidance > 1.0 else None
+                    ),
+                    sampler_mode=resolved.sampler,
+                    dcw_enabled=resolved.dcw,
+                    compute_dtype=resolved.compute_dtype,
+                    disable_tqdm=not self.progress,
+                )
+                drawn.append((result["target_latents"], dict(result["time_costs"])))
+        finally:
+            # Same ordering argument as Conditioner.release(): collect first so
+            # that every dead array has returned its buffer to MLX's cache, then
+            # clear the cache so the buffers go back to the OS.
+            del dit
+            gc.collect()
+            mx.clear_cache()
+        return drawn
 
     # --- Decode (MLX) ------------------------------------------------------
-    vae = audio = None
-    try:
-        t0 = time.time()
-        vae = _load_vae(base_snapshot)
-        audio = tiled_decode(vae, mx.array(latents).astype(mx.float32))
-        mx.eval(audio)
-        timings["decode"] = time.time() - t0
 
-        audio_np = np.array(audio[0])  # [samples, channels]
-    finally:
-        del vae, audio
-        gc.collect()
-        mx.clear_cache()
+    def _decode(
+        self,
+        requests: Sequence[ResolvedGenerationRequest],
+        drawn: Sequence[tuple[np.ndarray, dict[str, float]]],
+    ) -> Iterator[GenerationResult]:
+        vae = audio = None
+        try:
+            t0 = time.time()
+            vae = _load_vae(self._snapshot_pair()[1])
+            self.timings["load_vae"] = time.time() - t0
 
-    timings["peak_memory_gb"] = mx.get_peak_memory() / 1e9
-    return GenerationResult(
-        audio=audio_np,
-        sample_rate=SAMPLE_RATE,
-        seed=resolved.seed,
-        timings=timings,
-        tags=describe(spec, resolved),
-    )
+            for resolved, (latents, timings) in zip(requests, drawn, strict=True):
+                t0 = time.time()
+                audio = tiled_decode(vae, mx.array(latents).astype(mx.float32))
+                mx.eval(audio)
+                audio_np = np.array(audio[0])  # [samples, channels]
+                # Dropped before the take is handed over, not on the next pass
+                # round the loop: the caller writes a file in between, and a
+                # whole decode's buffers should not sit there while it does.
+                audio = None
+
+                timings["decode"] = time.time() - t0
+                # The batch's peak so far rather than this take's: the counter
+                # is a high-water mark over the process, and by design every
+                # take passes through the same largest stage.
+                timings["peak_memory_gb"] = mx.get_peak_memory() / 1e9
+
+                yield GenerationResult(
+                    audio=audio_np,
+                    sample_rate=SAMPLE_RATE,
+                    seed=resolved.seed,
+                    timings=timings,
+                    tags=describe(self.spec, resolved),
+                )
+        finally:
+            del vae, audio
+            gc.collect()
+            mx.clear_cache()
 
 
 # The one container we write. soundfile takes the format from the extension
@@ -646,6 +805,28 @@ def check_output_path(path: Path) -> None:
     # read-only file at *path* is replaced fine.
     if not os.access(existing, os.W_OK):
         raise ValueError(f"{existing} is not writable.")
+
+
+def take_paths(out: Path, seeds: Sequence[int | None]) -> list[Path]:
+    """Where a batch of takes is written, given the ``--out`` that was asked for.
+
+    A single take goes to *out* itself: one take is an ordinary generation and
+    should not have a name invented for it. More than one and each name carries
+    both its place in the batch and the seed that drew it -- the place because
+    that is the order they were generated in and the order a listing should sort
+    them into, the seed because it is what regenerates the one you keep. Both
+    are in the file's own tags too; a filename is what you have while choosing
+    between them.
+    """
+    if len(seeds) == 1:
+        return [out]
+    # Wide enough that the whole batch sorts lexically, which is how a file
+    # listing will order them.
+    width = max(2, len(str(len(seeds))))
+    return [
+        out.with_name(f"{out.stem}-{index:0{width}d}-seed-{seed}{out.suffix}")
+        for index, seed in enumerate(seeds, start=1)
+    ]
 
 
 def write_audio(

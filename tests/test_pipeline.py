@@ -250,14 +250,19 @@ def _run_with_stub_stages(
     log: list[str],
     fail_in: str | None = None,
     seen: dict | None = None,
+    seeds: list[int | None] | None = None,
+    drive=list,
     **kwargs,
-) -> None:
-    """Run generate() with every stage stubbed, failing in one of them.
+) -> list[pipeline.GenerationResult]:
+    """Run a session with every stage stubbed, failing in one of them.
 
     *log* collects what the pipeline loaded, ran and handed back, in order, so
-    that the cleanup can be asserted on -- including when generate() raises --
+    that the cleanup can be asserted on -- including when the session raises --
     without a checkpoint or 10 GB of weights. *seen*, if given, collects what
-    each stage was told; *kwargs* spoil the request the run is made with.
+    each stage was told; *seeds* is the batch to generate, defaulting to one
+    take; *drive* consumes the takes, and is the hook for a test that cares
+    when they arrive rather than what they are; *kwargs* spoil the request the
+    run is made with.
     """
     from as15.mlx import sampler
 
@@ -300,19 +305,25 @@ def _run_with_stub_stages(
             stage("decode")
             return mx.zeros((1, latents.shape[1] * models.VAE_HOP, 2))
 
+    def fake_load_vae(*args):
+        log.append("vae loaded")
+        return FakeVAE()
+
     def fake_diffusion(**called_with):
         stage("diffuse")
         if seen is not None:
-            seen["sampled"] = {
-                "src_latents_shape": called_with["src_latents_shape"],
-                "shift": called_with["shift"],
-                "steps": called_with["infer_steps"],
-                "guidance": called_with["guidance_scale"],
-                "seed": called_with["seed"],
-                "sampler": called_with["sampler_mode"],
-                "infer_method": called_with["infer_method"],
-                "dcw": called_with["dcw_enabled"],
-            }
+            seen.setdefault("sampled", []).append(
+                {
+                    "src_latents_shape": called_with["src_latents_shape"],
+                    "shift": called_with["shift"],
+                    "steps": called_with["infer_steps"],
+                    "guidance": called_with["guidance_scale"],
+                    "seed": called_with["seed"],
+                    "sampler": called_with["sampler_mode"],
+                    "infer_method": called_with["infer_method"],
+                    "dcw": called_with["dcw_enabled"],
+                }
+            )
         return {
             "target_latents": np.zeros((1, 2, models.LATENT_CHANNELS), np.float32),
             "time_costs": {},
@@ -325,12 +336,15 @@ def _run_with_stub_stages(
     monkeypatch.setattr(conditioning, "Conditioner", FakeConditioner)
     monkeypatch.setattr(sampler, "mlx_generate_diffusion", fake_diffusion)
     monkeypatch.setattr(pipeline, "_load_dit", lambda *args: log.append("dit loaded"))
-    monkeypatch.setattr(pipeline, "_load_vae", lambda *args: FakeVAE())
+    monkeypatch.setattr(pipeline, "_load_vae", fake_load_vae)
     # The piece of cleanup with an observable effect: whether the buffers a
     # stage allocated go back to the OS or stay checked out in MLX's cache.
     monkeypatch.setattr(mx, "clear_cache", lambda: log.append("mlx cache cleared"))
 
-    pipeline.generate(MODELS["xl-sft"], request(**kwargs), progress=False)
+    with pipeline.GenerationSession(
+        MODELS["xl-sft"], request(**kwargs), progress=False
+    ) as session:
+        return drive(session.takes(seeds if seeds is not None else [None]))
 
 
 def test_every_stage_hands_its_memory_back_when_it_finishes(monkeypatch):
@@ -347,6 +361,7 @@ def test_every_stage_hands_its_memory_back_when_it_finishes(monkeypatch):
         "dit loaded",
         "diffuse",
         "mlx cache cleared",
+        "vae loaded",
         "decode",
         "mlx cache cleared",
     ]
@@ -374,6 +389,139 @@ def test_a_stage_hands_its_memory_back_when_it_fails(monkeypatch, fail_in, clean
         _run_with_stub_stages(monkeypatch, log, fail_in=fail_in)
 
     assert log[-2:] == [fail_in, cleanup]
+
+
+# --- generating more than one take ---------------------------------------
+#
+# Two takes of one song differ by their seed and by nothing else, so every
+# stage but the diffusion loop is work the second take does not need doing
+# again. A session is what makes that true; these are the properties it has to
+# hold for the saving to be a saving rather than a way to get the wrong audio.
+
+
+def test_a_batch_loads_each_model_once_and_never_two_at_a_time(monkeypatch):
+    """The saving, and the ordering that has to survive it.
+
+    Four takes used to be four processes: four conditioning passes over the
+    same words, four loads of the same 8.3 GB DiT, four of the VAE. Doing them
+    once is the point -- but not at the cost of the phase order, which is what
+    keeps the peak at one model rather than two. So every diffusion still
+    happens before the VAE is loaded, and the DiT is released in between.
+    """
+    log: list[str] = []
+    _run_with_stub_stages(monkeypatch, log, seeds=[10, 11, 12])
+
+    assert log == [
+        "conditioner loaded",
+        "condition",
+        "conditioner released",
+        "dit loaded",
+        "diffuse",
+        "diffuse",
+        "diffuse",
+        "mlx cache cleared",  # the DiT goes back before the VAE arrives
+        "vae loaded",
+        "decode",
+        "decode",
+        "decode",
+        "mlx cache cleared",
+    ]
+
+
+def test_each_take_is_the_same_song_drawn_from_its_own_seed(monkeypatch):
+    """The seed is the only thing a batch varies, and it has to vary.
+
+    Conditioning the batch once is only sound because nothing in it depends on
+    the seed; handing the same seed to every take would make the saving
+    complete and the batch pointless.
+    """
+    seen: dict = {}
+    _run_with_stub_stages(monkeypatch, [], seen=seen, seeds=[10, 11, 12], guidance=5.0)
+
+    sampled = seen["sampled"]
+    assert [call["seed"] for call in sampled] == [10, 11, 12]
+    for call in sampled:
+        assert call == {**sampled[0], "seed": call["seed"]}
+
+
+def test_a_batch_records_the_seed_that_drew_each_take(monkeypatch):
+    """A take is worth keeping only if it can be told from its neighbours.
+
+    The tags are the recipe, so the one thing that differs between four takes
+    of a song is the one thing that must not be shared between their files.
+    """
+    takes = _run_with_stub_stages(monkeypatch, [], seeds=[10, 11, 12])
+
+    assert [take.seed for take in takes] == [10, 11, 12]
+    assert [take.tags["AS15_SEED"] for take in takes] == ["10", "11", "12"]
+    # And nothing else moved: same song, three draws.
+    for take in takes:
+        assert take.tags == {**takes[0].tags, "AS15_SEED": take.tags["AS15_SEED"]}
+
+
+def test_a_take_is_handed_over_as_it_decodes_rather_than_at_the_end(monkeypatch):
+    """Ten minutes of stereo float32 is 230 MB, and a batch of them is real.
+
+    Yielding lets the caller write each take out and drop it; returning them
+    together would hold the whole batch's audio until the last one decoded, on
+    a machine the rest of the pipeline is carefully staying inside.
+    """
+    log: list[str] = []
+    at_first_take: list[str] = []
+
+    def one_at_a_time(takes):
+        first = next(takes)
+        at_first_take.extend(log)
+        return [first, *takes]
+
+    _run_with_stub_stages(monkeypatch, log, seeds=[10, 11], drive=one_at_a_time)
+
+    assert at_first_take.count("decode") == 1, "the batch decoded ahead of the caller"
+    assert log.count("decode") == 2
+
+
+def test_the_seeds_of_a_batch_are_checked_before_any_of_it_runs(monkeypatch):
+    """Otherwise three takes render and the fourth cannot be drawn."""
+    log: list[str] = []
+    with pytest.raises(ValueError, match="seed"):
+        _run_with_stub_stages(monkeypatch, log, seeds=[10, 2**64])
+
+    assert log == []
+
+
+def test_a_batch_of_nothing_loads_nothing(monkeypatch):
+    log: list[str] = []
+    assert _run_with_stub_stages(monkeypatch, log, seeds=[]) == []
+    assert log == []
+
+
+# --- where a batch is written --------------------------------------------
+
+
+def test_one_take_is_written_where_it_was_asked_for():
+    """A batch of one is an ordinary generation; --out means --out."""
+    assert pipeline.take_paths(Path("out/song.flac"), [10]) == [Path("out/song.flac")]
+
+
+def test_a_batch_names_each_take_by_its_place_and_its_seed():
+    """Both, because they answer different questions.
+
+    The index is the order they were generated in, and sorts a listing into
+    that order; the seed is what regenerates the one worth keeping.
+    """
+    assert pipeline.take_paths(Path("out/song.flac"), [10, 11, 12]) == [
+        Path("out/song-01-seed-10.flac"),
+        Path("out/song-02-seed-11.flac"),
+        Path("out/song-03-seed-12.flac"),
+    ]
+
+
+def test_a_long_batch_still_sorts_in_the_order_it_was_generated():
+    """Two digits is not enough past 99, and 100 sorting before 11 is a mess."""
+    paths = pipeline.take_paths(Path("song.flac"), list(range(100)))
+    assert paths[0].name == "song-001-seed-0.flac"
+    assert paths[-1].name == "song-100-seed-99.flac"
+    assert [p.name for p in paths] == sorted(p.name for p in paths)
 
 
 # --- writing the output ---------------------------------------------------
@@ -660,9 +808,10 @@ def test_the_conditioning_and_the_diffusion_are_told_the_same_song(monkeypatch):
     _run_with_stub_stages(monkeypatch, log, seen=seen, duration=12.9)
 
     resolved = seen["conditioned"]
+    (sampled,) = seen["sampled"]
     assert resolved.latent_frames == 323
     assert resolved.metas_duration == 13
-    assert seen["sampled"]["src_latents_shape"] == (1, 323, models.LATENT_CHANNELS)
+    assert sampled["src_latents_shape"] == (1, 323, models.LATENT_CHANNELS)
     for field in (
         "shift",
         "steps",
@@ -672,10 +821,10 @@ def test_the_conditioning_and_the_diffusion_are_told_the_same_song(monkeypatch):
         "infer_method",
         "dcw",
     ):
-        assert seen["sampled"][field] == getattr(resolved, field), field
+        assert sampled[field] == getattr(resolved, field), field
 
     # And the file's own account of the run is that same resolved request, so
     # the sampler the loop was handed is the sampler the take is tagged with.
     tags = pipeline.describe(MODELS["xl-sft"], resolved)
-    assert tags["AS15_SAMPLER"] == seen["sampled"]["sampler"]
-    assert tags["AS15_INFER_METHOD"] == seen["sampled"]["infer_method"]
+    assert tags["AS15_SAMPLER"] == sampled["sampler"]
+    assert tags["AS15_INFER_METHOD"] == sampled["infer_method"]

@@ -22,7 +22,7 @@ So the job is to produce four things, then run one command:
 | Style prompt | `-p` | Genre, instruments, voice, texture, production |
 | Lyric sheet | `-L` (file) or `-l` (string) | Structure tags + words; omit for an instrumental |
 | Musical metas | `--bpm`, `--key`, `--time-signature`, `--language` | Unset means `N/A`, not "guess" |
-| Run settings | `-d`, `-m`, `--seed`, `-o` | Duration is a hard container for the lyrics |
+| Run settings | `-d`, `-m`, `--seed`, `--takes`, `-o` | Duration is a hard container for the lyrics |
 
 ```bash
 uv run as15 sing -p "STYLE PROMPT" -L lyrics.txt -d 180 --bpm 96 --key "A minor" -o out/song.flac
@@ -341,7 +341,10 @@ naming how many codes are needed.
 
 Seeds: `--seed` covers the whole run, plan included. Pin `--planner-seed` on its
 own to keep one plan while `--seed` moves the render, which is how you hear what
-the diffusion is contributing on top of the sketch.
+the diffusion is contributing on top of the sketch. `--plan --takes 4` does that
+in one command -- the plan is written once for the batch, because a plan is a
+property of the song rather than of a take, and the four renders differ only in
+their seed.
 
 Every planned take stores its plan in `AS15_AUDIO_CODES`, along with
 `AS15_PLANNER` and `AS15_PLANNER_SEED` when this run wrote it. A plan that
@@ -382,8 +385,17 @@ the final take will have.
 
 3. **Listen, change one thing, regenerate.** Prompt wording, a lyric line, the
    duration. Same seed throughout.
-4. **Explore takes** by dropping `--seed` once the prompt is right. The chosen
-   seed is printed on stderr and stored in the file, so a good take is never lost.
+4. **Explore takes** once the prompt is right. The seed is the whole difference
+   between two takes of a settled song, so generate several at once:
+
+   ```bash
+   uv run as15 sing -m xl-turbo --seed 100 --takes 4 -p "..." -L lyrics.txt -d 180 -o out/take.flac
+   ```
+
+   That writes `out/take-01-seed-100.flac` through `out/take-04-seed-103.flac`,
+   sharing one conditioning pass and one load of each model rather than paying
+   for four. Listen; keep the seed of the one that lands. A take is a function
+   of its seed, so re-rendering that seed on its own gives the same audio back.
 5. **Render on sft** with the seed and settings that worked:
 
    ```bash

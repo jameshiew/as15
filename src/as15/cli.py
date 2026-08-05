@@ -20,12 +20,15 @@ from .models import (
 )
 from .pipeline import (
     MAX_DURATION,
+    MAX_SEED,
     MIN_DURATION,
     OUTPUT_SUFFIX,
     GenerationRequest,
+    GenerationResult,
+    GenerationSession,
     check_output_path,
-    generate,
     resolve_request,
+    take_paths,
     write_audio,
 )
 
@@ -94,6 +97,31 @@ def _read_lyrics(lyrics: str | None, lyrics_file: Path | None) -> str:
     return lyrics or ""
 
 
+def _report(path: Path, result: GenerationResult) -> None:
+    """What one finished take cost, printed as it lands.
+
+    Per take rather than per run, because a batch shares everything but these
+    two numbers: diffusion and decode are the only stages it runs more than
+    once.
+    """
+    t = result.timings
+    seconds = len(result.audio) / result.sample_rate
+    typer.secho(
+        f"\nwrote {path}  ({seconds:.1f}s audio, {result.sample_rate} Hz "
+        f"{_channels(result.audio)})",
+        fg=typer.colors.GREEN,
+        err=True,
+    )
+    typer.secho(
+        "  diffusion {:.1f}s  decode {:.1f}s  peak {:.1f} GB".format(
+            t.get("diffusion_time_cost", 0.0),
+            t.get("decode", 0.0),
+            t.get("peak_memory_gb", 0.0),
+        ),
+        err=True,
+    )
+
+
 @app.command()
 def sing(
     prompt: Annotated[
@@ -151,6 +179,17 @@ def sing(
     seed: Annotated[
         int | None, typer.Option("--seed", help="Random seed. Omit for random.")
     ] = None,
+    takes: Annotated[
+        int,
+        typer.Option(
+            "--takes",
+            min=1,
+            help="Generate this many takes of the same song, seeds counting up "
+            "from --seed. They share one conditioning pass and one load of each "
+            "model, so the takes after the first cost only their own diffusion "
+            "and decode.",
+        ),
+    ] = 1,
     language: Annotated[
         str, typer.Option("--language", help="Vocal language code.")
     ] = "en",
@@ -228,6 +267,15 @@ def sing(
 
     if seed is None:
         seed = random.randint(0, 2**31 - 1)
+    # Counting up rather than drawing each independently: a batch is then named
+    # by its first seed, so `--seed 100 --takes 4` says exactly which four takes
+    # it produces and reproduces them all.
+    seeds = [seed + index for index in range(takes)]
+    if seeds[-1] > MAX_SEED:
+        raise typer.BadParameter(
+            f"--takes {takes} counting up from --seed {seed} runs past the "
+            f"largest seed there is ({MAX_SEED})."
+        )
 
     if plan and audio_codes is not None:
         raise typer.BadParameter(
@@ -259,24 +307,29 @@ def sing(
         planner_seed=planner_seed if planner_seed is not None else seed,
     )
 
-    # The same call generate() makes, so the banner below cannot report
+    # The same call the session makes, so the banner below cannot report
     # settings other than the ones that run -- and so a bad option costs a
     # second rather than the minutes it takes to reach the diffusion loop.
-    # Same for --out: what the write will insist on, asked before the run
-    # rather than after it.
+    # Same for the outputs: what the writes will insist on, asked before the
+    # run rather than after it, and for every take rather than the first.
+    paths = take_paths(out, seeds)
     try:
         resolved = resolve_request(spec, request)
-        check_output_path(out)
+        for path in paths:
+            check_output_path(path)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from None
 
     # Overwriting is the policy -- rerunning a command should not need the
     # last take cleared out of the way first -- but it is said out loud here,
     # while there is still time to stop, rather than discovered afterwards.
-    if out.exists():
-        typer.secho(
-            f"{out} exists and will be overwritten.", fg=typer.colors.YELLOW, err=True
-        )
+    for path in paths:
+        if path.exists():
+            typer.secho(
+                f"{path} exists and will be overwritten.",
+                fg=typer.colors.YELLOW,
+                err=True,
+            )
 
     if not lyrics_text.strip():
         typer.secho(
@@ -290,11 +343,19 @@ def sing(
     # The resolved duration rather than the one typed: the latent grid is 40 ms,
     # so `-d 12.9` is a 12.92 s take, and that is the length the metas block,
     # the decode and the file's own AS15_DURATION all say too.
+    seed_label = (
+        f"seed {seeds[0]}" if len(seeds) == 1 else f"seeds {seeds[0]}-{seeds[-1]}"
+    )
     typer.secho(
-        f"duration  {resolved.duration:g}s   steps {resolved.steps}   "
-        f"seed {resolved.seed}",
+        f"duration  {resolved.duration:g}s   steps {resolved.steps}   {seed_label}",
         err=True,
     )
+    if len(seeds) > 1:
+        typer.secho(
+            f"takes     {len(seeds)}, sharing one conditioning pass and one "
+            "load of each model",
+            err=True,
+        )
     typer.secho(
         f"sampling  shift {resolved.shift:g}   guidance {resolved.guidance:g}   "
         f"dcw {'on' if resolved.dcw else 'off'}",
@@ -319,37 +380,33 @@ def sing(
     # survives past the banner. Reported as an error rather than raised as a
     # usage error, which would print the whole help text underneath the
     # settings we just listed.
+    unwritten: list[Path] = []
     try:
-        result = generate(spec, request, device=device, progress=not quiet)
+        with GenerationSession(
+            spec, request, device=device, progress=not quiet
+        ) as session:
+            # Takes arrive as they decode, so each is on disk before the next
+            # one is generated: a batch interrupted half way through has kept
+            # what it had finished.
+            for path, result in zip(paths, session.takes(seeds), strict=True):
+                # A generation this far in is worth more than a traceback: an
+                # unwritable destination or a decode that came back non-finite
+                # is reported as an error, having left whatever was at *path*
+                # alone. The rest of the batch still runs -- the takes behind a
+                # bad write are worth no less than the ones in front of it.
+                try:
+                    write_audio(path, result.audio, result.sample_rate, result.tags)
+                except (ValueError, OSError) as exc:
+                    _err(f"Could not write {path}: {exc}")
+                    unwritten.append(path)
+                    continue
+                _report(path, result)
     except InputTooLong as exc:
         _err(str(exc))
         raise typer.Exit(2) from None
 
-    # A generation this far in is worth more than a traceback: an unwritable
-    # destination or a decode that came back non-finite is reported as an
-    # error, having left whatever was at *out* alone.
-    try:
-        write_audio(out, result.audio, result.sample_rate, result.tags)
-    except (ValueError, OSError) as exc:
-        _err(f"Could not write {out}: {exc}")
-        raise typer.Exit(1) from None
-
-    t = result.timings
-    seconds = len(result.audio) / result.sample_rate
-    typer.secho(
-        f"\nwrote {out}  ({seconds:.1f}s audio, {result.sample_rate} Hz "
-        f"{_channels(result.audio)})",
-        fg=typer.colors.GREEN,
-        err=True,
-    )
-    typer.secho(
-        "  diffusion {:.1f}s  decode {:.1f}s  peak {:.1f} GB".format(
-            t.get("diffusion_time_cost", 0.0),
-            t.get("decode", 0.0),
-            t.get("peak_memory_gb", 0.0),
-        ),
-        err=True,
-    )
+    if unwritten:
+        raise typer.Exit(1)
 
 
 @app.command("models")
