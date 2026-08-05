@@ -6,10 +6,14 @@ allowed-tools: Read, Write, Bash
 
 # Songwriting for as15
 
-`as15` generates exactly what you hand it. Nothing writes a style prompt for you,
-nothing invents lyrics, and nothing guesses a tempo or a key -- **you are the
-planner.** A meta you leave unset is not inferred: it reaches the conditioning as
-the literal string `N/A` and the model improvises around it.
+`as15` generates exactly what you hand it. Nothing writes a style prompt for you
+and nothing invents lyrics -- **you are the songwriter.** A meta you leave unset
+is not inferred: it reaches the conditioning as the literal string `N/A` and the
+model improvises around it.
+
+The one exception is `--plan` (§6), which runs a planner LM that will settle a
+tempo and a key for you and sketch the arrangement before the DiT starts. Even
+then the words and the style are yours.
 
 So the job is to produce four things, then run one command:
 
@@ -156,7 +160,8 @@ is rejected before the run starts.
 Set `--bpm` when you need to match other material, when the genre is tempo-defined
 (house ~124, boom bap ~90, drum and bass ~174), or when the lyric density needs a
 specific pace to fit. Set `--key` when you want a specific colour or a fixed
-vocal range. Otherwise leaving them off is fine.
+vocal range. Otherwise leaving them off is fine -- and if you would rather have a
+considered choice than `N/A`, `--plan` (§6) makes one and prints it.
 
 ---
 
@@ -269,8 +274,29 @@ Seeds: `--seed` covers the whole run, plan included. Pin `--planner-seed` on its
 own to keep one plan while `--seed` moves the render, which is how you hear what
 the diffusion is contributing on top of the sketch.
 
-Every planned take stores its plan in `AS15_AUDIO_CODES`, so a take can be
-re-rendered from the file it produced.
+Every planned take stores its plan in `AS15_AUDIO_CODES`, along with
+`AS15_PLANNER` and `AS15_PLANNER_SEED` when this run wrote it. A plan that
+arrived in a file names no planner -- the take cannot vouch for what wrote it.
+Recover one from a take you liked with:
+
+```bash
+ffprobe -v error -show_entries format_tags=AS15_AUDIO_CODES -of csv=p=0 out/a.flac > out/a.codes
+```
+
+**A plan crosses checkpoints, and a seed does not.** This is the useful part. A
+turbo seed does not reproduce a turbo take on sft, so the old loop was "draft on
+turbo, then audition sft takes until one lands". A plan is just the arrangement,
+and both checkpoints read it the same way -- so you can settle the arrangement on
+turbo, cheaply, and then render *that same arrangement* on sft:
+
+```bash
+uv run as15 plan -p "..." -L lyrics.txt -d 200 -o out/song.codes
+uv run as15 sing -m xl-turbo --audio-codes out/song.codes -p "..." -L lyrics.txt -d 200 -o out/draft.flac
+uv run as15 sing --audio-codes out/song.codes -p "..." -L lyrics.txt -d 200 -o out/final.flac
+```
+
+The draft is no longer only a check on the words -- it is a preview of the shape
+the final take will have.
 
 ---
 
@@ -296,14 +322,28 @@ re-rendered from the file it produced.
    ```
 
    A turbo seed does not reproduce the same take on sft -- different checkpoint,
-   different schedule. Expect to audition a few.
+   different schedule. Expect to audition a few, or write a plan first (§6) and
+   pass the same `--audio-codes` to both, which does carry across.
+
+For the take you actually keep, the highest-quality configuration is `xl-sft`
+with a 4B plan, everything else left at its default:
+
+```bash
+uv run as15 plan -p "..." -L lyrics.txt -d 200 --bpm 72 --key "A minor" -o out/song.codes
+uv run as15 sing --audio-codes out/song.codes -p "..." -L lyrics.txt -d 200 --bpm 72 --key "A minor" -o out/final.flac
+```
+
+Then vary one thing at a time from that same plan -- the seed, or `-g` between 5
+and 7 -- and keep the take that sounds best. Nothing in this repo can tell you
+which that is; it is a listening decision.
 
 Output must be `.flac`; the path is checked before the run, not after 10 minutes
 of diffusion. An existing file is overwritten and you are warned first.
 
 Every take carries its own recipe in Vorbis comments -- the prompt, the lyrics,
 `AS15_SEED`, `AS15_MODEL`, `AS15_CHECKPOINT`, steps, guidance, shift, sampler,
-DCW, and any metas that were set (`describe()` in `src/as15/pipeline.py`). None
+DCW, any metas that were set, and the plan it was rendered from
+(`describe()` in `src/as15/pipeline.py`). None
 of it is a clock or a machine ID, so the same command twice gives a
 byte-identical file. Read a take back with:
 
