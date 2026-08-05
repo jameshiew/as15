@@ -244,12 +244,14 @@ only setup beyond [just](https://just.systems/).
 
 ## Licence
 
-Code here is MIT. The ACE-Step 1.5 checkpoints are MIT and, per the model cards,
+Code here is MIT — see [LICENSE](LICENSE). The ACE-Step 1.5 checkpoints are MIT and, per the model cards,
 trained on licensed, royalty-free/public-domain and synthetic data with commercial
 use permitted — check the model card yourself before shipping anything.
 
 The MLX DiT, VAE, DCW and sampler modules under `src/as15/mlx/` are vendored from
-ACE-Step 1.5 (MIT) and adapted: repo coupling removed, the `pytorch_wavelets`
+ACE-Step 1.5 (MIT; its notice is preserved at
+[src/as15/mlx/LICENSE](src/as15/mlx/LICENSE)) and adapted: repo coupling
+removed, the `pytorch_wavelets`
 bridge dropped for pure-MLX Haar, a compute-dtype option added, the VAE encoder
 dropped (generation only ever decodes), and the sampler branches nothing here can
 reach — cover switching, repaint, retake, `mx.compile`, explicit timestep lists,

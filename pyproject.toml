@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Run ACE-Step 1.5 XL music generation on Apple Silicon via MLX"
 readme = "README.md"
 requires-python = ">=3.14"
+license = "MIT"
+license-files = ["LICENSE", "src/as15/mlx/LICENSE"]
 authors = [{ name = "James Hiew", email = "james@hiew.net" }]
 dependencies = [
   "einops>=0.8.2",
