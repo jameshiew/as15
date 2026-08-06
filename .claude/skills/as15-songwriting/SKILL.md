@@ -1,7 +1,7 @@
 ---
 name: as15-songwriting
-description: Write and generate songs with as15 (ACE-Step 1.5 XL on MLX). Covers settling the song before prompting, which genres the model renders well, style prompts, lyric sheets with structure tags, choosing duration/BPM/key/time signature, picking a checkpoint, planning with the 5Hz LM, the draft-then-render loop, choosing between takes, and fixing takes that come back wrong -- skipped lyrics, unrequested instruments, a chorus no bigger than the verse, harsh audio. Use when the user wants to create, write, plan, generate or troubleshoot a song in this repository.
-allowed-tools: Read, Write, Bash
+description: Write and generate songs with as15 (ACE-Step 1.5 XL on MLX). Covers settling the song before prompting, which genres the model renders well, style prompts, lyric sheets with structure tags, choosing duration/BPM/key/time signature, picking a checkpoint, planning with the 5Hz LM, the draft-then-render loop, choosing between takes, and fixing takes that come back wrong -- skipped lyrics, unrequested instruments, a chorus no bigger than the verse, harsh audio. Use whenever the user wants to write, plan, generate, improve or troubleshoot a song, a lyric sheet, a style prompt or a take in this repository, including when they only ask for "a command to make a track" or hand you a take that came back wrong.
+allowed-tools: Read, Write, Bash(uv run as15:*), Bash(${CLAUDE_SKILL_DIR}/scripts/check-take.py:*), Bash(${CLAUDE_SKILL_DIR}/scripts/read-caption.sh:*), Bash(ffprobe:*)
 ---
 
 # Songwriting for as15
@@ -9,11 +9,9 @@ allowed-tools: Read, Write, Bash
 `as15` generates exactly what you hand it. Nothing writes a style prompt for you
 and nothing invents lyrics -- **you are the songwriter.** A meta you leave unset
 is not inferred: it reaches the conditioning as the literal string `N/A` and the
-model improvises around it.
-
-The one exception is `--plan` (§6), which runs a planner LM that will settle a
-tempo and a key for you and sketch the arrangement before the DiT starts. Even
-then the words and the style are yours.
+model improvises around it. The one exception is `--plan`, which runs a planner
+LM that settles a tempo and a key and sketches the arrangement before the DiT
+starts. Even then the words and the style are yours.
 
 So the job is to produce four things, then run one command:
 
@@ -31,6 +29,27 @@ uv run as15 sing -p "STYLE PROMPT" -L lyrics.txt -d 180 --bpm 96 --key "A minor"
 Write lyric sheets to a file and pass `-L`. Multi-line lyrics through `-l` fight
 the shell over quoting and newlines for no benefit. `out/` is gitignored, which
 is where takes belong.
+
+**Where the rest lives.** This file is the judgement -- the decisions the CLI
+cannot make for you. Load a reference when you reach it. Paths below sit in this
+skill's own directory, `${CLAUDE_SKILL_DIR}`; run the scripts by that full path,
+since the working directory is the repo root rather than here. When you hand one
+of those commands to someone to run themselves, **write the resolved path**, not
+the variable -- their shell expands it to nothing and the command silently
+becomes `/scripts/...`.
+
+| File | Read it when |
+| --- | --- |
+| `references/troubleshooting.md` | A take came back wrong -- symptom by symptom, in the order worth trying |
+| `references/planning.md` | Using `--plan`, or the planner changed the voice, genre or instrumentation |
+| `references/sampling.md` | Tempted to override `-g`, `-s`, `--sampler`, `--dcw`; or choosing between finished takes |
+| `references/worked-example.md` | You want one complete run end to end, with measured numbers |
+| `references/after-the-render.md` | The take is worth keeping, you need to recover the settings from an existing take, or someone asks for a remix/extend as15 does not do |
+| `scripts/read-caption.sh` | Reading a planner's reasoning block out of its log |
+| `scripts/check-take.py` | Measuring a take, or a batch, before spending ears on it |
+
+The repo's own `README.md` is the reference for mechanics -- planner sizes, the
+Vorbis tag list, timings, `--takes` batching. It is accurate and one `Read` away.
 
 ---
 
@@ -87,13 +106,20 @@ detail onto one.
   format (`src/as15/conditioning.py`). Saying "120 BPM" in the prompt spends
   tokens telling the model something it is also being told properly, and the two
   can disagree.
-- **The prompt has a hard 256-token budget**, and roughly 54 of those are spent
-  on the instruction and metas lines wrapped around it -- so about 200 tokens,
-  call it 150 words, for your text. Over budget is **rejected**, not truncated:
-  the run stops before generating and tells you how many tokens and roughly how
-  many characters to cut.
-- A tight prompt of 15--40 words is usually the sweet spot. More detail is more
-  control and less room for the model to be interesting; less is the reverse.
+- **There is nowhere to put a negative.** as15 has no negative prompt, and CFG's
+  unconditional branch is a stored null embedding rather than text you supply,
+  so "no vocals" or "no guitars" just puts the words *vocals* and *guitars* into
+  your caption. State a short positive palette instead, and say the thing that
+  matters twice in different words.
+- **The prompt has a hard 256-token budget**, and 53--55 of those are spent on
+  the instruction and metas lines wrapped around it -- so about 200 tokens for
+  your text. Measured on the tokenizer, comma-separated tag prompts run about
+  1.6--2.1 tokens a word, so **200 tokens is nearer 100--125 words than 150.**
+  Prose runs leaner, around 1.3. Over budget is **rejected**, not truncated: the
+  run stops before generating and tells you how many tokens to cut.
+- A tight prompt of 15--40 words is usually the sweet spot -- well inside the
+  budget. More detail is more control and less room for the model to be
+  interesting; less is the reverse.
 
 **Craft:**
 
@@ -106,10 +132,9 @@ detail onto one.
    than naming it once.
 4. Reference tags ("in the style of 80s synthwave") carry a lot of aesthetic per
    token -- cheaper than enumerating the same thing instrument by instrument.
-   Name eras, scenes and traditions rather than artists: an artist's name is a
-   bet on what the model memorised of a catalogue you have no licence to, and
-   "brooding 80s synthwave, gated snare, arpeggiated bass" is the part you
-   actually wanted anyway.
+   Name eras, scenes and traditions rather than artists: "brooding 80s
+   synthwave, gated snare, arpeggiated bass" is the part you actually wanted,
+   and it does not bet the take on a catalogue nobody here has a licence to.
 5. Keep the prompt and the lyric tags consistent. If the prompt says piano ballad,
    a `[guitar solo]` tag is a fight the output loses.
 6. **Describe audible decisions, not judgements.** "Epic, emotional, beautiful,
@@ -184,9 +209,8 @@ Separate sections with a blank line.
 `[low energy]` `[building energy]` `[high energy]` `[explosive]`
 
 Use them sparingly and only where the prompt already supports them. These are
-conventions rather than a validated vocabulary -- nothing in this repo tests
-generation (see AGENTS.md), so treat any tag beyond the core structure ones as
-something to confirm by listening.
+conventions rather than a validated vocabulary -- nothing here tests generation
+-- so confirm any non-core tag by listening.
 
 ### Writing that sings
 
@@ -213,8 +237,11 @@ something to confirm by listening.
 
 ### Instrumentals
 
-Omit lyrics entirely. The CLI warns on stderr that it is generating an
-instrumental, and the FLAC gets no `LYRICS` tag. Put the arrangement in `-p`.
+Omit lyrics entirely -- there is no flag for it. The CLI warns on stderr that it
+is generating an instrumental, and the FLAC gets no `LYRICS` tag. Put the
+arrangement in `-p`, and keep every vocal word out of it: "female vocals",
+"topline", "choir", "sung". Writing "no vocals" does the opposite of what it
+looks like -- see the negative-prompt rule in §1.
 
 Upstream's own guide offers a second form: a sheet of section tags and no words,
 as a map of an instrumental piece.
@@ -228,9 +255,12 @@ as a map of an instrumental piece.
 ```
 
 as15 passes that through as an ordinary lyric sheet -- it is not empty, so there
-is no instrumental warning and the FLAC does carry a `LYRICS` tag. Whether it
-buys you structure or gets the tags sung is a listening question; if a voice
-appears, fall back to empty lyrics and describe the arrangement in `-p`.
+is no instrumental warning and the FLAC does carry a `LYRICS` tag, and the
+words in those tags are as available to be sung as any other. **Treat it as an
+experiment, not a technique**: empty lyrics is the form that reliably produces
+an instrumental. If you try it and a voice appears, that is the expected
+failure, not bad luck -- fall back to empty lyrics and put the arrangement
+in `-p`.
 
 ---
 
@@ -242,7 +272,7 @@ feel, say so.
 
 | Flag | Accepts | Notes |
 | --- | --- | --- |
-| `--bpm` | whole number, **30--300** | slow 60--80, mid 90--120, fast 130--180 |
+| `--bpm` | whole number, **30--300** | Beats per minute, never bars -- in 3/4 a bar is three of them. Slow 60--80, mid 90--120, fast 130--180 |
 | `--key` | free text, one line | `"C major"`, `"A minor"`, `"F# minor"`. Common keys behave best |
 | `--time-signature` | **`2`, `3`, `4` or `6`** | A bare integer -- `3` for a waltz, **not** `"3/4"`. Anything else is rejected |
 | `--language` | code, default `en` | Lowercased, written into the `# Languages` header; must match the lyrics |
@@ -262,7 +292,8 @@ Set `--bpm` when you need to match other material, when the genre is tempo-defin
 (house ~124, boom bap ~90, drum and bass ~174), or when the lyric density needs a
 specific pace to fit. Set `--key` when you want a specific colour or a fixed
 vocal range. Otherwise leaving them off is fine -- and if you would rather have a
-considered choice than `N/A`, `--plan` (§6) makes one and prints it.
+considered choice than `N/A`, `--plan` makes one and prints it
+(`references/planning.md`).
 
 ---
 
@@ -270,7 +301,8 @@ considered choice than `N/A`, `--plan` (§6) makes one and prints it.
 
 10 to 600 seconds, default 120. **This is a container, not a hint** -- the model
 has to fit the whole lyric sheet into it. Too short and the delivery is crammed
-and verses go missing; too long and you get instrumental drift at the end.
+and verses go missing; too long and you get instrumental drift at the end. The
+120 default is not a decision; a run that never set `-d` has not chosen a length.
 
 Rough section costs at 90--120 BPM in 4/4:
 
@@ -293,6 +325,11 @@ Sanity check before generating: **sung lines x ~4 s, plus the instrumental
 sections.** If that exceeds `-d`, cut lines or raise the duration. Slower tempos
 need more seconds for the same words; faster ones fit more but still need air.
 When in doubt, go longer -- a song with room to breathe beats one that rushes.
+
+That check counts sung lines, so **an instrumental has nothing to count** -- go
+straight to the bar arithmetic below, budgeting bars per section from the
+arrangement you described in `-p`. It is the only estimate available when there
+is no sheet, and it is the better one either way.
 
 Once `--bpm` is set, count the arrangement in bars instead and the estimate stops
 being a guess:
@@ -323,175 +360,35 @@ uv run as15 models
 | | `xl-sft` (default) | `xl-turbo` |
 | --- | --- | --- |
 | Steps | 50 | 8 |
-| Guidance | 7.0 | none (distilled; `-g` ignored) |
+| Guidance | 7.0 | none (distilled; `-g` forced to 1.0) |
 | Shift | 1.0 | 3.0 |
 | DCW | off | on |
 | Relative speed | 1x | ~15x |
 | Use for | the take you keep | drafting and iteration |
 
-**Do not scale the README's 30 s timings linearly** -- they overstate a
-full-length take by around 3x. A large part of every step is fixed work over the
-text conditioning, so the per-second cost falls as the take gets longer. Measured
-on an M5, 32 GB, for a **200 s** song:
+**Iterate on turbo, render on sft.** That ratio is the whole workflow. It is 15x
+and not the 6x of the step counts because sft runs CFG, which is two forward
+passes per step. The README's **Timings** section has the measured numbers; the
+one worth carrying in your head is that a full-length sft take is minutes, not
+the ~18 that scaling the README's 30 s row would predict -- a large part of every
+step is fixed work over the text conditioning, so per-second cost falls as the
+take gets longer.
 
-| Stage | Time |
-| --- | --- |
-| 4B plan (1000 codes) | 2 min 36 s |
-| `xl-turbo` diffusion | 24 s |
-| `xl-sft` diffusion | 6 min 3 s |
-| VAE decode (either) | ~36 s |
+**Everything else leaves its default.** `-s`, `--dcw`, `--precision` and
+`--sampler` already follow the checkpoint, and the two that look most like
+quality knobs are the likeliest to cost you a render: `-s 30` on sft is *below*
+its 50, not above it, and forcing DCW on a non-distilled checkpoint makes output
+mushy. `-g` between 5 and 7 is the one worth varying, on sft only.
+`references/sampling.md` has the reasoning; read it before overriding any.
 
-Peak was 9.1--9.2 GB either way, since decode is chunked. A full-length sft render
-is minutes rather than the ~18 that linear scaling predicts -- but turbo is still
-**15x** cheaper, and that ratio is the whole workflow: iterate on turbo, render on
-sft. (It is 15x and not the 6x of the step counts because sft runs CFG, which is
-two forward passes per step.)
-
-- `-g / --guidance` (sft only): 7.0 is the default. Lower (3--5) follows the
-  prompt more loosely and often sounds more natural; higher is more literal and
-  can get brittle. `1.0` disables CFG and halves the cost. Upstream's own
-  documentation contradicts itself over which checkpoints take CFG at all -- the
-  model zoo says sft and base, the Gradio guide describes the field as base-only
-  -- so here the checkpoint decides and the table above is the answer. A recipe
-  from elsewhere quoting a guidance number for turbo is describing a surface that
-  is not this one.
-- `-s / --steps`: leave alone unless you are deliberately trading quality for
-  time. Below the checkpoint default, quality drops off quickly. Above it is
-  mostly folklore: turbo at 20 or 50 steps circulates as a fix for skipped words,
-  but it is unreplicated single-user reporting, it costs the 15x that made turbo
-  worth using, and 8 is the count the checkpoint was distilled for. Skipped words
-  are cheaper to fix in the sheet -- see §8.
-- `--sampler heun` evaluates the model twice per step for a second-order step --
-  roughly double the diffusion time. Most worthwhile on 8-step turbo, where the
-  step count is small enough that accuracy per step matters.
-- **`--dcw` / `--no-dcw`: leave alone.** as15 already follows the checkpoint --
-  off for `xl-sft`, on for `xl-turbo`. Wavelet-domain correction was tuned for
-  the distilled models, and forcing it on a non-distilled one makes output mushy
-  and distorted. The override is there for experiments, not for tuning a take.
-- `--precision`: `bf16`. `fp32` doubles memory for no measurable gain.
+Planning is the other axis and has its own file: `references/planning.md`. In
+short -- `--plan` sketches the arrangement with a 5Hz LM before the DiT starts,
+it settles any metas you left unset, and **its reasoning caption can contradict
+your prompt**, so read the caption before paying for a render.
 
 ---
 
-## 6. Planning (`--plan`)
-
-By default the DiT starts from silence and writes the whole track from the
-prompt and lyrics alone. `--plan` runs the **5Hz planner LM** first: it sketches
-the song as one audio code per 200 ms and the DiT renders that sketch instead.
-
-```bash
-uv run as15 sing -p "..." -L lyrics.txt -d 180 --plan -o out/song.flac
-```
-
-| | Direct (default) | `--plan` |
-| --- | --- | --- |
-| Extra download | none | 1.2--8.4 GB, once |
-| Extra time | none | ~2 min for a 2-minute plan on the 4B |
-| Control | prompt and lyrics only | the plan also fixes the arrangement |
-
-`--planner` picks the size: `0.6b`, `1.7b`, or `4b` (default, and upstream's own
-pick for quality). The planner is loaded and released before conditioning, so it
-does not raise the peak.
-
-Size buys long-tail knowledge rather than general polish. The 4B earns its 8.4 GB
-on unusual genres, uncommon instruments and dense arrangements -- the material a
-smaller model has thin coverage of. Upstream's own framing is that a bigger LM
-does *not* automatically improve ordinary pop or rock, and a four-on-the-floor
-house track is something all three have seen ten thousand times. So `1.7b` is
-worth an A/B on straightforward material rather than assumed to be worse; the
-comparison costs one plan each.
-
-The planner also **fills in metas you left unset** -- it settles a bpm, a key and
-a time signature and writes them into its reasoning block, which is printed on
-stderr. Anything you set with `--bpm` / `--key` / `--time-signature` overrides
-it, and the duration is always yours. So `--plan` is a way to get a considered
-tempo and key rather than `N/A`, without having to pick them yourself.
-
-### Read the reasoning block
-
-It is not only metas. The planner writes itself a full prose caption of the song
-it is about to sketch, and **that caption can contradict your prompt.** A prompt
-saying `warm female vocals` came back with:
-
-```
-caption: ... The lead vocal is delivered by a smooth male singer using expressive
-falsetto, complemented by layered backing vocals including female harmonies ...
-```
-
-The DiT is conditioned on the plan *and* on your text, so the two then fight for
-the whole render. The fix is the ordinary one for prompt ambiguity -- say it
-twice, in different words (`warm female lead vocal, soulful female topline`) --
-and plan again. A re-plan is one LM pass; finding it after a six-minute sft
-render is not.
-
-The block goes to stderr, buried in the planner's progress bar, so it needs
-unpicking to read:
-
-```bash
-uv run as15 plan -p "..." -L lyrics.txt -d 200 -o out/song.codes 2>plan.log
-tr '\r' '\n' < plan.log | grep -viE 'planning:|Fetching'
-```
-
-Check it against the prompt before spending a render on it: the vocal, the
-instrumentation, and whether the structure it describes is the one your lyric
-tags asked for.
-
-Plans are worth keeping, and not only to save the time. The planner is most
-useful while the song is still vague -- it will settle a tempo, a key and an
-arrangement out of a thin brief, which is exactly the job you do not want to do
-yourself at that stage. It is least useful once your specification is precise,
-where a fresh `--plan` is one more opportunity to reinterpret a song you had
-already decided: a re-plan re-rolls the caption, and the caption is what moved
-the voice, the genre or the instrumentation last time. **Writing the plan to a
-file is how you stop asking.** Use the LM early, then freeze what it gave you.
-
-Planning is also one LM pass against fifty DiT passes, so write it once and
-render it several ways:
-
-```bash
-uv run as15 plan -p "..." -L lyrics.txt -d 180 -o out/song.codes
-uv run as15 sing -p "..." -L lyrics.txt -d 180 --audio-codes out/song.codes -g 5 -o out/a.flac
-uv run as15 sing -p "..." -L lyrics.txt -d 180 --audio-codes out/song.codes -g 8 -o out/b.flac
-```
-
-The prompt, lyrics and duration passed to `sing` must be the ones the plan was
-written for -- the plan is a sketch *of that song*, and the DiT is still
-conditioned on the text as well. A plan shorter than the duration is rejected,
-naming how many codes are needed.
-
-Seeds: `--seed` covers the whole run, plan included. Pin `--planner-seed` on its
-own to keep one plan while `--seed` moves the render, which is how you hear what
-the diffusion is contributing on top of the sketch. `--plan --takes 4` does that
-in one command -- the plan is written once for the batch, because a plan is a
-property of the song rather than of a take, and the four renders differ only in
-their seed.
-
-Every planned take stores its plan in `AS15_AUDIO_CODES`, along with
-`AS15_PLANNER` and `AS15_PLANNER_SEED` when this run wrote it. A plan that
-arrived in a file names no planner -- the take cannot vouch for what wrote it.
-Recover one from a take you liked with:
-
-```bash
-ffprobe -v error -show_entries format_tags=AS15_AUDIO_CODES -of csv=p=0 out/a.flac > out/a.codes
-```
-
-**A plan crosses checkpoints, and a seed does not.** This is the useful part. A
-turbo seed does not reproduce a turbo take on sft, so the old loop was "draft on
-turbo, then audition sft takes until one lands". A plan is just the arrangement,
-and both checkpoints read it the same way -- so you can settle the arrangement on
-turbo, cheaply, and then render *that same arrangement* on sft:
-
-```bash
-uv run as15 plan -p "..." -L lyrics.txt -d 200 -o out/song.codes
-uv run as15 sing -m xl-turbo --audio-codes out/song.codes -p "..." -L lyrics.txt -d 200 -o out/draft.flac
-uv run as15 sing --audio-codes out/song.codes -p "..." -L lyrics.txt -d 200 -o out/final.flac
-```
-
-The draft is no longer only a check on the words -- it is a preview of the shape
-the final take will have.
-
----
-
-## 7. The loop
+## 6. The loop
 
 1. **Plan.** Style prompt, structure, duration, metas. Write the lyric sheet to a
    file, e.g. `lyrics.txt` or `out/<name>.txt`.
@@ -531,24 +428,15 @@ the final take will have.
    for four. Listen; keep the seed of the one that lands. A take is a function
    of its seed, so re-rendering that seed on its own gives the same audio back.
 
-   **Choose the song, not the cleanest audio.** Score each take 0--2 on seven
-   things and the choice stops being a vibe:
+   **Choose the song, not the cleanest audio.** A take that scored zero on the
+   hook is not a candidate however spotless the rest of it is -- polishing a
+   strong composition is ordinary work, rescuing a clean forgettable one is
+   starting again with extra steps. `references/sampling.md` has the seven-axis
+   score sheet that turns that into a decision rather than a vibe.
 
-   | Dimension | Question |
-   | --- | --- |
-   | Hook | Can you remember the chorus after one listen? |
-   | Form | Are the sections distinct, and in the order the sheet asked for? |
-   | Prosody | Do the words sit on the beat, or fight it? |
-   | Vocal | Convincing, and intelligible? |
-   | Groove | Do the drums and bass move on purpose? |
-   | Dynamics | Is the chorus genuinely bigger than the verse? |
-   | Audio | Clicks, clipping, hiss, harshness? |
-
-   Do not let the total decide on its own: a take that scored zero on Hook is
-   not a candidate however spotless the rest of it is. Polishing a strong
-   composition is ordinary work; rescuing a clean forgettable one is starting
-   again with extra steps. Audio is also the axis most likely to improve on its
-   own at step 5 -- see the measurements in the worked example.
+   `${CLAUDE_SKILL_DIR}/scripts/check-take.py out/take-*.flac` measures length, peak, dynamic range
+   and stereo width across a batch, and draws each take's RMS envelope. It says
+   which takes are worth your ears, not which one is good.
 5. **Render on sft** with the seed and settings that worked:
 
    ```bash
@@ -556,47 +444,30 @@ the final take will have.
    ```
 
    A turbo seed does not reproduce the same take on sft -- different checkpoint,
-   different schedule. Expect to audition a few, or write a plan first (§6) and
-   pass the same `--audio-codes` to both, which does carry across.
+   different schedule. Expect to audition a few, or write a plan first and pass
+   the same `--audio-codes` to both, which does carry across
+   (`references/planning.md`).
 
 For the take you actually keep, the highest-quality configuration is `xl-sft`
 with a 4B plan, everything else left at its default:
 
 ```bash
-uv run as15 plan -p "..." -L lyrics.txt -d 200 --bpm 72 --key "A minor" -o out/song.codes 2>plan.log
-tr '\r' '\n' < plan.log | grep -viE 'planning:|Fetching'   # does the caption match the prompt?
+uv run as15 plan -p "..." -L lyrics.txt -d 200 --bpm 72 --key "A minor" -o out/song.codes 2>out/plan.log
+${CLAUDE_SKILL_DIR}/scripts/read-caption.sh out/plan.log      # does the caption match the prompt?
 uv run as15 sing --audio-codes out/song.codes -p "..." -L lyrics.txt -d 200 --bpm 72 --key "A minor" -o out/final.flac
 ```
 
-The middle line is not optional -- see §6. Reading the plan's caption costs
-nothing and catches a prompt the planner misread before the render pays for it.
+The middle line is not optional. Reading the plan's caption costs nothing and
+catches a prompt the planner misread before the render pays for it.
 
 Then vary one thing at a time from that same plan -- the seed, or `-g` between 5
 and 7 -- and keep the take that sounds best. Nothing in this repo can tell you
 which that is; it is a listening decision.
 
 Output must be `.flac`; the path is checked before the run, not after 10 minutes
-of diffusion. An existing file is overwritten and you are warned first.
-
-Every take carries its own recipe in Vorbis comments -- the prompt, the lyrics,
-`AS15_SEED`, `AS15_MODEL`, `AS15_CHECKPOINT`, steps, guidance, shift, sampler,
-DCW, any metas that were set, and the plan it was rendered from
-(`describe()` in `src/as15/pipeline.py`). None
-of it is a clock or a machine ID, so the same command twice gives a
-byte-identical file. Read a take back with:
-
-```bash
-ffprobe -v error -show_entries format_tags -of default out/final.flac
-```
-
-The style prompt comes back as `comment`: ffmpeg maps the Vorbis `DESCRIPTION`
-field onto its own key, so asking for `format_tags=DESCRIPTION` returns nothing.
-Every `AS15_*` field keeps its name, so a single value pulls out cleanly -- which
-is how you recover the seed of a take worth re-rendering:
-
-```bash
-ffprobe -v error -show_entries format_tags=AS15_SEED -of csv=p=0 out/final.flac
-```
+of diffusion. An existing file is overwritten and you are warned first. Every
+take carries its own recipe in Vorbis comments, so a take can always be
+re-rendered from itself -- see `references/after-the-render.md`.
 
 Pre-fetch weights before a first run so the download is not mistaken for a hang:
 
@@ -606,240 +477,30 @@ uv run as15 download -m xl-sft
 
 ---
 
-## 8. When it comes back wrong
+## 7. When it comes back wrong
 
-Find the symptom, then work the right-hand column in the order it is written and
-stop when it is fixed. Almost none of these are sampler problems, and reaching
-for `-s` first is the most reliable way to spend fifteen minutes and learn
-nothing.
+**Read `references/troubleshooting.md`** -- it maps each symptom to the changes
+worth making, in the order worth making them. Almost none of them are sampler
+problems, and reaching for `-s` first is the most reliable way to spend fifteen
+minutes and learn nothing.
 
-| Symptom | What to change, in order |
-| --- | --- |
-| **Lines skipped, a verse missing, the bridge raced through** | Redo the §4 arithmetic -- a crammed container is far and away the commonest cause. Then shorten lines, even out syllables within a section, simplify the form, strip stacked tag modifiers, and draw four fresh seeds. Not more steps: skipping is reported at every step count there is, so no number of them guarantees delivery. |
-| **An instrument nobody asked for** | Read the plan's reasoning caption (§6) -- it usually named it first. Then cut the contradiction in `-p` that invited it and state a short positive palette. There is nowhere to put a negative: as15 has no negative prompt, CFG's unconditional branch is a stored null embedding rather than text you supply, so "no guitars" is just the word "guitars" in your caption. Re-plan, or drop `--plan` and see if it was the LM's idea. |
-| **The chorus is no bigger than the verse** | Put the arc in `-p` and not only in the tags (§1, rule 7): the model will happily render one texture for four minutes. Shorten the hook so it has room to open up, make the verse genuinely sparse in the writing, and expect to finish the contrast with a fader (§9). |
-| **Harsh, brittle, hissy, everything at one level** | Expected on a turbo draft. The measured draft below pinned its peak at 0.999 with 8.9 dB of range; sft from the same plan came back at 0.877 and 15.5 dB. Render on sft before treating it as a prompt problem. If it survives sft, audition more seeds, then fix it in the mix. |
-| **The planner changed the voice, the genre or the language** | §6, and it is the reason that section exists. Read the block, say the thing twice in different words, re-plan at a new seed. If it keeps drifting, drop `--plan`: the direct path cannot contradict you, having no opinion to contradict you with. |
-| **Vocals in something meant to be instrumental** | Empty lyrics is the reliable form; a tag-only sheet is not. Strip every vocal word from `-p` as well -- "female vocals", "topline", "choir", "sung" -- then draw more seeds. |
-| **Wrong language, or an accent you did not ask for** | `--language` has to match the words, and matching it is necessary rather than sufficient: upstream names multilingual lyric compliance as a standing limitation and English as the safe case. Non-English takes need more seeds and more listening; `zh_rap` is called out on the model card as its own weak spot. |
-| **The run refuses to start** | Read the message and believe it. Prompt over 256 tokens, lyrics over 2048, `--time-signature` outside `(2, 3, 4, 6)`, `--bpm` outside 30--300, output not `.flac`, or a plan with fewer codes than the duration needs. All of it is checked before a single weight loads, which is why a typo costs a second. |
+It covers: lines skipped or a verse raced through; an instrument nobody asked
+for; a chorus no bigger than the verse; harsh, flat or hissy audio; the planner
+changing the voice, genre or language; vocals in something meant to be
+instrumental; the wrong language or accent; a run that refuses to start; a whole
+batch wrong the same way; and a take that is fine but forgettable.
 
----
-
-## 9. After the render
-
-### What as15 will not do
-
-The model has more tasks than this CLI exposes. There is **no remix, cover,
-repaint, extend or reference-audio path here.** as15 implements the text-to-audio
-half only, and the audio-to-codes tokenizer the editing tasks need is never even
-built (`src/as15/conditioning.py`). Advice found elsewhere about Remix strength,
-Repaint windows or a reference track is describing upstream's Gradio and ComfyUI
-surfaces, not this one, and there is no flag here to map it onto.
-
-What there is instead: re-render the same plan at another seed, another
-guidance, or the other checkpoint. That gives you variations of one song rather
-than a transformation of a recording -- and for a section that will not come out
-right, it is regenerate-and-comp rather than repair in place.
-
-### Finish it outside the generator
-
-The complaints that recur about ACE-Step output are vocal expressiveness,
-dynamic contrast, drum transitions, groove and how memorable the melody is.
-Those are the hardest things to generate and none of them is a step count. as15
-writes 48 kHz stereo FLAC, which is a fine thing to import:
-
-- comp the best sections together -- takes rendered from one plan share an
-  arrangement, so they are the ones most likely to line up, but check both
-  boundaries by ear;
-- automate the verse-to-chorus level change the model under-plays;
-- reinforce or replace the drums, particularly transitions and fills;
-- de-ess, tame the harshness, clear the low end;
-- master last, once the arrangement has stopped moving.
-
-### Originality
-
-MIT covers this code and upstream's weights. It says nothing about anyone else's
-songs. Upstream's own guidance is to check output for originality, disclose that
-a track is AI-generated, and get permission for protected material used as a
-source or a reference -- which in practice means keeping artist names out of `-p`
-(§1) and existing lyrics out of the sheet.
+Two are worth knowing without opening anything, being the commonest and the most
+misdiagnosed. **A crammed `-d` is the usual cause of skipped and rushed
+lyrics** -- redo the §4 arithmetic first, and note that a run still on the 120 s
+default never chose a length at all. And **a chorus no bigger than the verse is
+a prompt problem**, not a sampler one: put the arc in `-p`, not only in the tags.
 
 ---
 
-## Worked example
+## 8. After the render
 
-"Hold the Morning" -- the canonical run: 4B plan, `xl-sft`, everything else at
-its default. Every number below was measured on it.
-
-**The spec** (§0), settled before anything else: a night nobody wants to end;
-defiance turning into euphoria by the last drop; contemporary soulful deep house;
-one warm female lead; Rhodes, sub bass, filtered pads, shuffled hats over a
-four-on-the-floor kick; sparse verse rising through a build into a wide drop,
-three times; the section order set out under **Duration** below.
-
-**Genre first.** The brief was only "something the model generates well", so §1's
-genre-fit table picked it: soulful deep house. Four-on-the-floor gives a 200 s
-take a grid to hold, the hook repeats so the lyric budget goes into one line, and
-the vocal sits under reverb -- which is where coarse vocal synthesis stops
-mattering. It also avoids the named weak spot, guitar-forward rock.
-
-**Prompt**
-
-```
-soulful deep house, warm female lead vocal, soulful female topline,
-four-on-the-floor kick, deep round sub bass, dusty Rhodes chords,
-filtered analog pads, crisp shuffled hi-hats, spacious plate reverb,
-late-night club warmth
-```
-
-Thirty words over genre, voice, five instruments, texture and production. The
-voice is named twice on purpose -- see the re-plan below.
-
-**Metas** -- `--bpm 122` (house is tempo-defined), `--key "D minor"`,
-`--time-signature 4`, `--language en`.
-
-**Duration** -- intro 14 + verse 16 + build 16 + drop 24 + breakdown 12 +
-verse 16 + build 16 + drop 24 + bridge 14 + build 10 + drop 24 + outro 14 = ~200,
-so `-d 200`.
-
-**Lyrics** (`out/hold-the-morning.txt`)
-
-```
-[intro]
-
-[verse]
-Nobody counted the hours
-Nobody watched the door
-The bassline knows my name
-I don't need mine anymore
-
-[build]
-Four in the morning, still standing
-Ceiling is starting to glow
-Hold it, hold it, hold it
-Don't let it go
-
-[chorus - drop]
-Hold the morning off a while
-Every hand up in the light
-We were never going home
-Not tonight (not tonight)
-Hold the morning off
-
-[breakdown]
-
-[verse]
-Somebody's coat on the floor
-Somebody's song on repeat
-The whole room breathes as one
-And nothing is waiting outside
-
-[build]
-Four in the morning, still standing
-Ceiling is starting to glow
-Hold it, hold it, hold it
-Don't let it go
-
-[chorus - drop]
-Hold the morning off a while
-Every hand up in the light
-We were never going home
-Not tonight (not tonight)
-Hold the morning off
-
-[bridge - low energy]
-Let the light stand in the street
-Let it wait outside for me
-
-[build]
-One more hour
-One more hour
-ONE MORE HOUR
-
-[chorus - drop]
-HOLD THE MORNING OFF A WHILE
-EVERY HAND UP IN THE LIGHT
-We were never going home
-Not tonight (not tonight)
-Hold the morning off
-
-[outro]
-Not tonight (not tonight)
-[fade out]
-```
-
-Lines run 6--8 syllables and stay parallel across the two verses. One metaphor --
-refusing the dawn -- from three angles. `[build]` into `[chorus - drop]` three
-times is the shape the genre already wants; the empty `[intro]` and `[breakdown]`
-are deliberate instrumental sections; `(not tonight)` is a backing vocal and the
-capitalised last chorus lifts it. The first two choruses are word-for-word
-identical, which is what makes one listen enough to say whether the model can
-land the same hook twice; only the third departs from them.
-
-**Plan, and check it**
-
-```bash
-uv run as15 plan -p "$PROMPT" -L out/hold-the-morning.txt -d 200 \
-  --bpm 122 --key "D minor" --time-signature 4 --seed 1122 \
-  -o out/hold-the-morning.codes 2>plan.log
-tr '\r' '\n' < plan.log | grep -viE 'planning:|Fetching'
-```
-
-The first plan's caption described "a smooth male singer using expressive
-falsetto" against a prompt that said female vocals. The prompt gained a second,
-differently-worded statement of the voice (`warm female lead vocal, soulful female
-topline`) and the plan was rewritten at a new seed; the second came back with "a
-powerful female lead vocal ... layered backing vocals ... dynamic builds leading
-into instrumental drops". 2 min 36 s each time. **Do not skip this check** -- it
-is the cheapest step in the run and it guards the most expensive one.
-
-**Draft on turbo from that plan, then render on sft from the same plan**
-
-```bash
-uv run as15 sing -m xl-turbo --audio-codes out/hold-the-morning.codes \
-  -p "$PROMPT" -L out/hold-the-morning.txt -d 200 \
-  --bpm 122 --key "D minor" --time-signature 4 --seed 1123 \
-  -o out/hold-the-morning-draft.flac
-```
-
-```bash
-uv run as15 sing --audio-codes out/hold-the-morning.codes \
-  -p "$PROMPT" -L out/hold-the-morning.txt -d 200 \
-  --bpm 122 --key "D minor" --time-signature 4 --seed 1123 \
-  -o out/hold-the-morning.flac
-```
-
-24 s of diffusion against 6 min 3 s, from one arrangement -- so the draft is a
-real preview of the final's shape, not a different song at the same tempo.
-
-### What you can check without listening
-
-Listening is still the decision. But a few cheap measurements catch a dead run
-before it wastes an audition, and they showed the sft take was the better one on
-every axis:
-
-| | draft (turbo) | final (sft) |
-| --- | --- | --- |
-| Dynamic range, 4 s RMS windows | 8.9 dB | **15.5 dB** |
-| Stereo width (side/mid RMS) | 0.27 | **0.83** |
-| Sample peak | 0.999, pinned to the ceiling | 0.877, with headroom |
-
-Worth checking on any take: that it is the length you asked for, that the peak is
-not pinned at 1.0, that the RMS envelope moves rather than sitting flat, and --
-if the sheet ends in `[fade out]` -- that the tail actually decays. This one went
-from -14.8 dB to -61.7 dB over its last four seconds.
-
-```bash
-uv run --with numpy --with soundfile python - <<'EOF'
-import numpy as np, soundfile as sf
-x, sr = sf.read("out/hold-the-morning.flac")
-m, w = x.mean(axis=1), 4 * 48000
-rms = np.array([np.sqrt((m[i:i+w]**2).mean()) for i in range(0, len(m)-w+1, w)])
-db = 20 * np.log10(np.maximum(rms, 1e-6))
-print(f"{len(m)/sr:.1f}s  peak={np.abs(x).max():.3f}  dyn={db.max()-db.min():.1f}dB")
-print("".join(" .:-=+*#%@"[min(9, int((d-db.min())/(db.max()-db.min())*9.99))] for d in db))
-EOF
-```
-
-None of that says whether it is any good. It says whether it is worth your ears.
+Once a take is worth keeping -- comping, fixing dynamics, recovering a recipe
+from a file, what as15 structurally cannot do (no remix, extend, repaint or
+reference audio), and upstream's guidance on originality -- see
+`references/after-the-render.md`.
